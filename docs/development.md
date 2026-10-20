@@ -804,7 +804,7 @@ UA / `client_platform` / `client_os` 切成 web，则应同时设 `emulation = "
 | `emulation` | `okhttp4_12` | `chrome136` | 官方 Web 客户端 = 桌面 Chrome |
 | `user_agent` | `DeepSeek/2.5.0 Android/35` | 桌面 Chrome/140 | 同上 |
 | `client_platform` / `client_os` | `android` | `web` | 同上 |
-| completion payload | 无 `source` | `source = "input"` | 前端 bundle：官方一定带该字段 |
+| completion payload | 无 `source` | `source = "default"` | 上游枚举只接受 `default` / `landing`（`input` 被 422 拒绝） |
 
 ### prompt 形态对齐（delta 发送，已实现）
 

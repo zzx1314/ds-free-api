@@ -147,8 +147,8 @@ check(
     f"session={replay.get('chat_session_id')}",
 )
 check(
-    "所有请求都带 source=input 与风控令牌头",
-    all(r["body"].get("source") == "input" for r in recs)
+    "所有请求都带 source=default 与风控令牌头",
+    all(r["body"].get("source") == "default" for r in recs)
     and all(r["headers"].get("x-hif-leim") for r in recs),
 )
 

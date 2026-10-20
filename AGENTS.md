@@ -684,7 +684,7 @@ Follow `docs/code-style.md`:
 | HTTP server/routes | `src/server/` | handlers → stream → error; `request_id_middleware` mints `req-{n}` + `x-request-id` |
 | Idempotency cache | `src/server/idempotency.rs` | `Idempotency-Key` scope/conflict/replay rules + `RecordingStream` for SSE replay |
 | PoW WASM solver | `ds_core/src/accounts/pow.rs` | wasmtime loading, dynamic export probing, DeepSeekHashV1 |
-| DeepSeek HTTP client | `ds_core/src/accounts/client.rs` | `Envelope::into_result()`, WAF detection, all API methods. `ClientIdentity::headers(FetchSite)` also overrides wreq's navigation-style defaults with the captured XHR header set; `CompletionPayload` carries `source = "input"` like the official client |
+| DeepSeek HTTP client | `ds_core/src/accounts/client.rs` | `Envelope::into_result()`, WAF detection, all API methods. `ClientIdentity::headers(FetchSite)` also overrides wreq's navigation-style defaults with the captured XHR header set; `CompletionPayload` carries `source = "default"` (upstream's enum only accepts `default` / `landing`; `input` is rejected with 422) |
 | HIF risk-control tokens | `ds_core/src/accounts/hif.rs` | `x-hif-leim` **and** `x-hif-dliq`: two isomorphic no-auth endpoints, TTL from `x-hif-ttl`, per-device buckets, attached to SSE requests only (whichever is available). Missing them marks the request as a non-official client — see `docs/development.md` (2026-10-07) |
 | Unified debug CLI | `examples/adapter_cli.rs` | Modes: chat/raw/compare/concurrent/status/models |
 | Risk-token probe | `examples/hif_probe.rs` | Checks the `hif-leim` endpoint only — **no account traffic** (`hif-dliq` is NXDOMAIN in some networks; the browser also fails to fetch it there) |

@@ -260,17 +260,18 @@ pub struct CompletionPayload {
     pub search_enabled: bool,
     /// 真实客户端固定发送该字段（会话首条为 null）
     pub action: Option<serde_json::Value>,
-    /// 消息来源（官方前端的输入方式：`input` / `click` / `keyboard` / `paste` …）
+    /// 消息来源（官方前端的入口来源）
     ///
     /// 2026-10-07 从前端 bundle 提取：真实客户端的 completion payload 一定带
-    /// `source`，取值是**用户如何发出这条消息**。代理侧按「键盘输入 + 发送」的
-    /// 主路径填 `input`（真实用户最常态的方式）。
+    /// `source`。上游的枚举是封闭集合 —— 2026-10-20 实测只接受 `default` /
+    /// `landing`，发 `input` 会被 422 拒绝（`unknown variant 'input'`），
+    /// 因此代理统一填 `default`。
     pub source: &'static str,
     pub preempt: bool,
 }
 
-/// 代理侧统一使用的 `source` 取值（对齐真实客户端的主路径：输入框输入）
-pub const COMPLETION_SOURCE_INPUT: &str = "input";
+/// 代理侧统一使用的 `source` 取值（上游唯一可用的中性值）
+pub const COMPLETION_SOURCE_DEFAULT: &str = "default";
 
 #[derive(Debug, Serialize)]
 #[allow(dead_code)]

@@ -243,9 +243,11 @@ maxBackoffMs = 1000 * getFrozenFeature("hif_max_retry_interval_secs", 600);
   thinking_enabled, search_enabled, source, action, preempt }
 ```
 
-- **`source`**：*用户如何发出这条消息* —— `input`（输入框回车）/ `click`（发送按钮）/
-  `keyboard` / `paste` / `drag` / `file_picker` / `search` / `landing` / `api` 等。
-  代理侧统一填 `input`（真实用户最常态的路径）。
+- **`source`**：从哪个入口发出这条消息。上游是**封闭枚举** —— 2026-10-20 实测
+  只接受 `default` / `landing`，前端 bundle 里看到的 `input`（输入框回车）/ `click` /
+  `keyboard` / `paste` / `drag` / `file_picker` / `search` / `api` 等服务端已不再接受：
+  发 `input` 会得到 `422`（`unknown variant 'input', expected 'default' or 'landing'`）。
+  代理侧统一填 `default`。
 - **`prompt`**：**只包含最新一条用户消息的文本**。历史不在 prompt 里 ——
   它保存在服务端会话中，靠 `parent_message_id` 串联（前端 bundle 中**没有任何**
   `<｜Role｜>` 之类标签字面量）。本代理在 `session_policy = reuse` 且纯对话形态下也已

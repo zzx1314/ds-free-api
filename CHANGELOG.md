@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **completion payload 的 `source` 改为 `default`**：上游枚举是封闭集合，只接受
+  `default` / `landing`；此前按前端 bundle 填的 `input` 现在被 `422` 拒绝
+  （`unknown variant `input`, expected `default` or `landing`），导致每个请求都失败。
+
 ### ⚠️ 默认配置改为「对齐浏览器」（行为变更）
 
 > 原则：**我们并不知道上游依据哪些信号判定违规**，因此每一项都向真实客户端靠拢 ——
@@ -27,7 +33,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **不再默认联网搜索**：`default_search_enabled` 默认 `false`（官方客户端只有用户
   显式打开搜索才会搜索）；客户端仍可用 `web_search_options` 显式开启
 - **completion payload 补齐 `source` 字段**：从前端 bundle 提取到官方请求一定带
-  `source`（取值是用户如何发出消息：`input` / `click` / `paste` …），代理按主路径填 `input`
+  `source`；代理统一填上游枚举接受的 `default`（`input` 会被 `422` 拒绝）
 - 回退到旧行为：`emulation = "okhttp4_12"`、
   `user_agent = "DeepSeek/2.5.0 Android/35"`、`client_platform = "android"`、
   `client_os = "android"`、`startup_health_check = true`、
