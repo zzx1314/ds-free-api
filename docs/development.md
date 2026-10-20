@@ -64,8 +64,19 @@ mobile = ""
 area_code = ""
 password = ""          # token 模式不需要密码
 token = "eyJhbGciOi..."
-device_id = ""         # 可选；填了则同时决定 X-Device-Id 与 HIF 令牌分桶
+device_id = "Bjyk87PcoVWPPBrs3aHGg...=="  # 强烈建议填（见下）
 ```
+
+`device_id` 在 token 模式下**不参与校验** —— 唯一把它放进请求体的是
+`POST /users/auth_token/check_device`，而 token 模式整个跳过了它。但它仍然决定两件事：
+
+1. **X-Device-Id**（`account_x_device_id`：有 `device_id` 时按它派生，**每个账号唯一**）；
+2. **HIF 风控令牌分桶**（`x-hif-leim` / `x-hif-dliq` 按设备身份缓存）。
+
+留空时会回退到全局派生的 X-Device-Id（默认按 `api_base` 派生），于是所有留空的 token
+账号共用同一个设备身份和同一个令牌桶 —— 而 `warn_on_shared_device_ids` 对空值是 `continue`，
+这种共用连告警都不会有。建议把抓 token 的那个浏览器 profile 的数美 `device_id` 一起填上，
+让 X-Device-Id 与 token 的签发设备保持一致。
 
 行为差异（与密码模式对比）：
 

@@ -63,7 +63,10 @@ port = 22217
 # ⚠️ token 会过期（上游换发/退出登录即失效）。失效后账号被标记为 invalid 并停止
 #    重试，日志出现 "导入的 token 已失效/被拒"，重新从浏览器复制一份即可。
 # ⚠️ 账号标识（email / mobile）仍要填一个，用于展示与去重；password 可留空。
-# ⚠️ token 模式下 device_id 可留空；填了则同时决定 X-Device-Id 与 HIF 令牌分桶。
+# ⚠️ device_id 在 token 模式下**不参与校验**（不走 check_device），但**强烈建议填**：
+#    填抓 token 的那个浏览器的数美 device_id，使 X-Device-Id 与 token 的签发设备一致。
+#    留空会回退到全局派生的 X-Device-Id —— 多个 token 账号因此共用同一设备身份和
+#    同一个 HIF 令牌桶，且**不会**触发共用指纹告警（空值被跳过）。
 # 示例：
 # [[ds_core.accounts]]
 # email = "user2@example.com"
@@ -71,7 +74,7 @@ port = 22217
 # area_code = ""
 # password = ""
 # token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
-# device_id = ""
+# device_id = "Bjyk87PcoVWPPBrs3aHGgXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX=="
 
 # 客户端拟态身份：**默认全部对齐真实浏览器**（官方 Web 客户端 = 一套桌面 Chrome 身份）。
 #
