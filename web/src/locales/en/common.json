@@ -92,6 +92,8 @@
       "mobile": "Mobile",
       "areaCode": "Area Code",
       "password": "Password",
+      "token": "Bearer Token",
+      "tokenPlaceholder": "Browser Bearer token (token auth: no password login)",
       "deviceId": "Device ID",
       "deviceIdPlaceholder": "Browser device fingerprint ID",
       "add": "Add Account",

@@ -657,9 +657,10 @@ impl DsClient {
 
     /// 当前登录用户信息（含禁言状态）
     ///
-    /// 与登录响应的 user 字段同构；探测禁言优先用登录响应（零额外请求），
-    /// 此方法保留作原始客户端 API 对称面（同 `update_title` / `edit_message`）。
-    #[allow(dead_code)]
+    /// 与登录响应的 user 字段同构。
+    ///
+    /// token 模式（导入浏览器 Bearer token）用它校验令牌 + 读取禁言状态，
+    /// 从而完全不调用 `/users/login`。
     pub async fn current_user(&self, token: &str) -> Result<UserInfo, ClientError> {
         let resp = self
             .http

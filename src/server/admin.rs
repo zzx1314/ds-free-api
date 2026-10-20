@@ -136,6 +136,8 @@ pub struct AccountView {
     pub area_code: String,
     pub password: String,
     pub device_id: String,
+    /// 浏览器导入的 Bearer token（非空 = token 模式，不调 /users/login）
+    pub token: String,
 }
 
 // ── 脱敏 ─────────────────────────────────────────────────────────────────
@@ -158,6 +160,7 @@ fn mask_config(config: &Config) -> AdminConfigResponse {
                     area_code: a.area_code.clone(),
                     password: a.password.clone(),
                     device_id: a.device_id.clone(),
+                    token: a.token.clone(),
                 })
                 .collect(),
             api_base: config.ds_core.api_base.clone(),
@@ -407,6 +410,17 @@ pub(crate) async fn admin_put_config(
             {
                 a.device_id.clone_from(&existing.device_id);
             }
+            // token 为空 / "***" 时保留现有值：GET 会回填真实值，
+            // 但旧前端或手写配置不会发送该字段
+            if (a.token.is_empty() || a.token == "***")
+                && let Some(existing) = current
+                    .ds_core
+                    .accounts
+                    .iter()
+                    .find(|e| e.email == a.email && e.mobile == a.mobile)
+            {
+                a.token.clone_from(&existing.token);
+            }
         }
         // Admin 配置：空的 password_hash/jwt_secret 保留现有值（前端不返回这些字段）
         if new_config.admin.password_hash.is_empty() {
@@ -561,6 +575,7 @@ email = "a@example.com"
 mobile = ""
 area_code = ""
 password = "pw"
+token = "tok-1"
 device_id = "dev-1"
 
 [proxy]
@@ -654,6 +669,14 @@ description = "test"
                 "account view 缺少字段 {field}"
             );
         }
+    }
+
+    #[test]
+    fn imported_token_round_trips_through_admin_config() {
+        let view = mask_config(&sample_config());
+        let json = serde_json::to_value(&view).unwrap();
+        // 配置页需要回填 token（token 模式）；留空/*** 由 PUT 处理时保留原值
+        assert_eq!(json["ds_core"]["accounts"][0]["token"], "tok-1");
     }
 
     #[test]

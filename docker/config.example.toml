@@ -50,6 +50,29 @@ port = 22217
 # password = "pass3"
 # device_id = "Bjyk87PcoVWPPBrs3aHGgXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX=="
 
+# token 模式（导入浏览器 Bearer token，**不调用 /users/login**）
+#
+# 填了 token 的账号改用 token 认证：初始化只发一次 GET /users/current 校验有效性
+# 并读取禁言状态（is_muted / mute_until），之后不再产生任何登录流量。
+# 登录是唯一带设备风控校验（device_id → check_device）的入口，反复登录本身就是
+# 风险信号；不想让代理持有密码、或密码登录总被风控拦截时用这个模式。
+#
+# 获取方式：浏览器登录 https://chat.deepseek.com ，F12 → Network，任选一个
+# /api/v0/* 请求，复制请求头 Authorization 里 "Bearer " 之后的部分。
+#
+# ⚠️ token 会过期（上游换发/退出登录即失效）。失效后账号被标记为 invalid 并停止
+#    重试，日志出现 "导入的 token 已失效/被拒"，重新从浏览器复制一份即可。
+# ⚠️ 账号标识（email / mobile）仍要填一个，用于展示与去重；password 可留空。
+# ⚠️ token 模式下 device_id 可留空；填了则同时决定 X-Device-Id 与 HIF 令牌分桶。
+# 示例：
+# [[ds_core.accounts]]
+# email = "user2@example.com"
+# mobile = ""
+# area_code = ""
+# password = ""
+# token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+# device_id = ""
+
 # 客户端拟态身份：**默认全部对齐真实浏览器**（官方 Web 客户端 = 一套桌面 Chrome 身份）。
 #
 # 为什么默认浏览器档：我们并不知道上游依据哪些信号判定违规，因此每一项都向真实

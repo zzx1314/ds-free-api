@@ -39,6 +39,7 @@ export function ConfigPage() {
   const [message, setMessage] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [revealedKeys, setRevealedKeys] = useState<Record<number, boolean>>({});
   const [revealedPasswords, setRevealedPasswords] = useState<Record<number, boolean>>({});
+  const [revealedTokens, setRevealedTokens] = useState<Record<number, boolean>>({});
   const [copiedKeyIdx, setCopiedKeyIdx] = useState<number | null>(null);
 
   useEffect(() => {
@@ -318,7 +319,7 @@ export function ConfigPage() {
                       />
                     </div>
 
-                    <div className="sm:col-span-2">
+                    <div className="sm:col-span-3">
                       <label htmlFor={`acc-pass-${i}`} className="text-[11px] font-medium text-muted-foreground block mb-1">
                         {t('config.accounts.password')}
                       </label>
@@ -347,6 +348,35 @@ export function ConfigPage() {
                     </div>
 
                     <div className="sm:col-span-3">
+                      <label htmlFor={`acc-token-${i}`} className="text-[11px] font-medium text-muted-foreground block mb-1">
+                        {t('config.accounts.token')}
+                      </label>
+                      <div className="relative">
+                        <Input
+                          id={`acc-token-${i}`}
+                          type={revealedTokens[i] ? 'text' : 'password'}
+                          placeholder={t('config.accounts.tokenPlaceholder')}
+                          value={a.token ?? ''}
+                          onChange={(e) => {
+                            const next = [...config.ds_core.accounts];
+                            next[i] = { ...next[i], token: e.target.value };
+                            update(['ds_core', 'accounts'], next);
+                          }}
+                          className="text-xs font-mono pr-8"
+                          autoComplete="off"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setRevealedTokens((prev) => ({ ...prev, [i]: !prev[i] }))}
+                          className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                          aria-label="Toggle token visibility"
+                        >
+                          {revealedTokens[i] ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="sm:col-span-11">
                       <label htmlFor={`acc-device-id-${i}`} className="text-[11px] font-medium text-muted-foreground block mb-1">
                         {t('config.accounts.deviceId')}
                       </label>
@@ -392,7 +422,7 @@ export function ConfigPage() {
             onClick={() =>
               update(['ds_core', 'accounts'], [
                 ...config.ds_core.accounts,
-                { email: '', mobile: '', area_code: '', password: '', device_id: '' },
+                { email: '', mobile: '', area_code: '', password: '', token: '', device_id: '' },
               ])
             }
             className="gap-1.5 text-xs mt-2"

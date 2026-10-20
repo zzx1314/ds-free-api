@@ -49,6 +49,35 @@ device_id = "抓取到的值"
 管理面板 → 配置页也有该字段；提交时留空（或旧前端不发送该字段）会保留服务端已有值，
 因此升级后既有配置无需改动。
 
+### token 模式：导入浏览器 Bearer token（不调用 `/users/login`）
+
+不想让代理持有密码、或密码登录总被风控拦截时，可以用 token 模式：账号填上从浏览器
+复制的 Bearer token，`ds_core` 就**完全不调 `/users/login`**（也不调 `check_device`）。
+
+获取方式：浏览器登录 `https://chat.deepseek.com` → F12 → Network → 任选一个
+`/api/v0/*` 请求 → 复制 `Authorization: Bearer` 后面的部分，填到 `token`：
+
+```toml
+[[ds_core.accounts]]
+email = "you@example.com"
+mobile = ""
+area_code = ""
+password = ""          # token 模式不需要密码
+token = "eyJhbGciOi..."
+device_id = ""         # 可选；填了则同时决定 X-Device-Id 与 HIF 令牌分桶
+```
+
+行为差异（与密码模式对比）：
+
+| 阶段 | 密码模式 | token 模式 |
+|------|----------|------------|
+| 初始化 | `POST /users/login` → 禁言早检 → `POST /users/auth_token/check_device` | `GET /users/current`（一次，校验 token + 读 `is_muted`） |
+| 恢复任务（Error 状态） | 重新登录 | 重新校验 token（**不登录**） |
+| token 失效 | 重新登录换新 token | `40003` / 401 → 账号置 `invalid`，等用户重新导入 |
+
+注意：token 会过期，账号被置为 `invalid` 后需要从浏览器重新复制一份并保存配置。
+账号标识（`email` / `mobile`）仍需填一个，用于账号列表展示与去重。
+
 > 提醒：官方近期对共享账号封禁力度很大，公开测试账号基本已全部失效，
 > 请使用自己的账号并在多账号间保持合理并发（推荐并发数 = 账号数 ÷ 2）。
 

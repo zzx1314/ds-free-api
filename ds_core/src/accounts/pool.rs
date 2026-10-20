@@ -14,7 +14,7 @@ use futures::future::join_all;
 use log::{debug, error, info, warn};
 use tokio::sync::{RwLock, Semaphore};
 
-use super::client::{ClientError, CompletionPayload, DsClient, LoginPayload};
+use super::client::{ClientError, CompletionPayload, DsClient, LoginPayload, UserInfo};
 use super::pow::{PowError, PowSolver};
 use crate::config::AccountConfig;
 
@@ -331,6 +331,13 @@ impl Account {
 
     pub fn token(&self) -> Arc<str> {
         self.token.read().unwrap().clone()
+    }
+
+    /// 是否使用导入的 Bearer token（token 模式）
+    ///
+    /// token 模式没有可用于重新登录的密码：恢复任务只能重新校验 token。
+    pub fn uses_imported_token(&self) -> bool {
+        !self.creds.token.trim().is_empty()
     }
 
     pub fn display_id(&self) -> &str {
@@ -797,18 +804,19 @@ impl AccountPool {
         }
     }
 
-    /// 尝试重新登录 Error 状态的账号
-    /// 成功 → Idle，失败 → error_count++，≥3 则 Invalid
     /// 登录阶段的**终止性**错误：重试不会改变结果
     ///
     /// 封禁（10）/ 禁言（5）/ 设备校验失败（11）/ 凭据错误（2）以及本地校验失败，
     /// 反复重试只会继续打上游 —— 文档里明确「禁言后继续重试不会加速解禁，反而可能延长」。
+    /// token 模式下 `40003 Authorization Failed`（导入的 token 失效）与 HTTP 401
+    /// 同属无凭据可刷新的情况。
     const fn is_terminal_login_error(e: &PoolError) -> bool {
         match e {
             PoolError::Validation(_) => true,
             PoolError::Client(ClientError::Business { code, .. }) => {
-                matches!(code, 2 | 5 | 10 | 11)
+                matches!(code, 2 | 5 | 10 | 11 | 40003)
             }
+            PoolError::Client(ClientError::Status { status, .. }) => *status == 401,
             _ => false,
         }
     }
@@ -820,6 +828,13 @@ impl AccountPool {
         startup_health_check: bool,
     ) {
         let display_id = account.display_id().to_string();
+
+        // token 模式没有密码可重登：改为重新校验导入的 token，不产生登录流量
+        if account.uses_imported_token() {
+            Self::revalidate_imported_token(account).await;
+            return;
+        }
+
         match try_init_account(&account.creds, client, solver, startup_health_check).await {
             Ok(new_account) => {
                 // 更新 token
@@ -849,6 +864,50 @@ impl AccountPool {
                     error!(target: "ds_core::accounts", "Account {display_id} re-login failed {count} times, marked as Invalid: {e}");
                 } else {
                     warn!(target: "ds_core::accounts", "Account {display_id} re-login failed (attempt {count}): {e}");
+                }
+            }
+        }
+    }
+
+    /// token 模式的恢复动作：重新校验导入的 token
+    ///
+    /// 没有任何登录请求：token 失效（`40003` / 401）时无凭据可刷新，
+    /// 直接置 `Invalid` 等用户重新导入；网络类错误仍有 `MAX_ERROR_COUNT` 上限。
+    async fn revalidate_imported_token(account: &Account) {
+        let display_id = account.display_id().to_string();
+        let token = account.token();
+
+        let result = match account.client().current_user(&token).await {
+            Ok(user) => ensure_not_muted(&user, &display_id, "token 校验"),
+            Err(e) => Err(PoolError::Client(e)),
+        };
+
+        match result {
+            Ok(()) => {
+                account
+                    .state
+                    .store(AccountState::Idle as u8, Ordering::Relaxed);
+                account.error_count.store(0, Ordering::Relaxed);
+                info!(target: "ds_core::accounts", "Account {display_id} 导入的 token 仍有效");
+            }
+            Err(e) if Self::is_terminal_login_error(&e) => {
+                account
+                    .state
+                    .store(AccountState::Invalid as u8, Ordering::Relaxed);
+                error!(
+                    target: "ds_core::accounts",
+                    "Account {display_id} 导入的 token 已失效/被拒，已标记 Invalid（请重新导入）: {e}"
+                );
+            }
+            Err(e) => {
+                let count = account.error_count.fetch_add(1, Ordering::Relaxed) + 1;
+                if count >= MAX_ERROR_COUNT {
+                    account
+                        .state
+                        .store(AccountState::Invalid as u8, Ordering::Relaxed);
+                    error!(target: "ds_core::accounts", "Account {display_id} token 校验失败 {count} 次，已标记 Invalid: {e}");
+                } else {
+                    warn!(target: "ds_core::accounts", "Account {display_id} token 校验失败 (attempt {count}): {e}");
                 }
             }
         }
@@ -981,83 +1040,16 @@ async fn try_init_account(
     // 失败不阻断（与客户端轮询失败时的行为一致）
     client.warm_up_hif().await;
 
-    let login_payload = LoginPayload {
-        email: creds.email.clone(),
-        mobile: creds.mobile.clone(),
-        password: creds.password.clone(),
-        area_code: creds.area_code.clone(),
-        device_id: creds.device_id.clone(),
-        os: client.client_os().to_string(),
+    // 两种凭据来源：
+    // - token 模式（账号配置里填了 `token`）：完全不碰 `/users/login`；
+    //   登录是唯一带设备风控校验（`device_id` → `check_device`）的入口，
+    //   反复登录本身就是风险信号，token 模式下不再产生这类流量。
+    // - 密码模式（历史行为）：登录 → 禁言早检 → `check_device`。
+    let token = if creds.token.trim().is_empty() {
+        login_and_check_device(creds, client).await?
+    } else {
+        verify_imported_token(creds, client).await?
     };
-
-    let login_data = client.login(&login_payload).await?;
-    debug!(
-        target: "ds_core::client",
-        "登录响应: code={}, msg={}, user_id={}, email={:?}, mobile={:?}, muted={:?}, mute_until={:?}",
-        login_data.code,
-        login_data.msg,
-        login_data.user.id,
-        login_data.user.email,
-        login_data.user.mobile_number,
-        login_data.user.chat.as_ref().map(|c| c.is_muted),
-        login_data.user.chat.as_ref().and_then(|c| c.mute_until),
-    );
-
-    // 禁言早检：登录响应即带 chat.is_muted/mute_until，无需等 health_check
-    // 的一次完整 completion 才暴露（禁言账号 health_check 必然失败）。
-    if let Some(chat) = &login_data.user.chat
-        && chat.is_muted != 0
-    {
-        error!(
-            target: "ds_core::accounts",
-            "Account {} is muted until {:?} (detected at login)",
-            display_id_of(creds),
-            chat.mute_until
-        );
-        return Err(PoolError::Validation(format!(
-            "账号异常(muted/limited)，mute_until={:?}",
-            chat.mute_until
-        )));
-    }
-
-    let mut token = login_data.user.token;
-
-    // 设备校验 / 令牌轮换：真实客户端登录成功后立即调用
-    match client.check_device(&token).await {
-        Ok(data) => {
-            if let Some(rotate) = data.rotate.as_ref() {
-                match super::client::extract_rotate_token(rotate) {
-                    Some(new_token) => {
-                        debug!(
-                            target: "ds_core::accounts",
-                            "Account {} token rotated via check_device",
-                            display_id_of(creds)
-                        );
-                        token = new_token;
-                    }
-                    None => debug!(
-                        target: "ds_core::accounts",
-                        "Account {} check_device rotate 形态未知，保持原令牌: {}",
-                        display_id_of(creds),
-                        rotate
-                    ),
-                }
-            } else {
-                debug!(
-                    target: "ds_core::accounts",
-                    "Account {} check_device ok (no rotation)",
-                    display_id_of(creds)
-                );
-            }
-        }
-        // check_device 失败不阻断初始化（真实客户端亦非关键路径）
-        Err(e) => debug!(
-            target: "ds_core::accounts",
-            "Account {} check_device failed (ignored): {}",
-            display_id_of(creds),
-            e
-        ),
-    }
 
     let display_id = display_id_of(creds);
 
@@ -1104,6 +1096,128 @@ async fn try_init_account(
         session: Mutex::new(None),
         client: client.clone(),
     })
+}
+
+/// 密码模式：登录 → 禁言早检 → 设备校验 / 令牌轮换
+///
+/// 返回可用的 Bearer token。登录响应即带 `chat.is_muted` / `mute_until`，
+/// 因此禁言无需等一次完整的 health_check completion 才暴露。
+async fn login_and_check_device(
+    creds: &AccountConfig,
+    client: &DsClient,
+) -> Result<String, PoolError> {
+    let login_payload = LoginPayload {
+        email: creds.email.clone(),
+        mobile: creds.mobile.clone(),
+        password: creds.password.clone(),
+        area_code: creds.area_code.clone(),
+        device_id: creds.device_id.clone(),
+        os: client.client_os().to_string(),
+    };
+
+    let login_data = client.login(&login_payload).await?;
+    debug!(
+        target: "ds_core::client",
+        "登录响应: code={}, msg={}, user_id={}, email={:?}, mobile={:?}, muted={:?}, mute_until={:?}",
+        login_data.code,
+        login_data.msg,
+        login_data.user.id,
+        login_data.user.email,
+        login_data.user.mobile_number,
+        login_data.user.chat.as_ref().map(|c| c.is_muted),
+        login_data.user.chat.as_ref().and_then(|c| c.mute_until),
+    );
+
+    ensure_not_muted(&login_data.user, display_id_of(creds), "login")?;
+
+    let mut token = login_data.user.token;
+
+    // 设备校验 / 令牌轮换：真实客户端登录成功后立即调用
+    match client.check_device(&token).await {
+        Ok(data) => {
+            if let Some(rotate) = data.rotate.as_ref() {
+                match super::client::extract_rotate_token(rotate) {
+                    Some(new_token) => {
+                        debug!(
+                            target: "ds_core::accounts",
+                            "Account {} token rotated via check_device",
+                            display_id_of(creds)
+                        );
+                        token = new_token;
+                    }
+                    None => debug!(
+                        target: "ds_core::accounts",
+                        "Account {} check_device rotate 形态未知，保持原令牌: {}",
+                        display_id_of(creds),
+                        rotate
+                    ),
+                }
+            } else {
+                debug!(
+                    target: "ds_core::accounts",
+                    "Account {} check_device ok (no rotation)",
+                    display_id_of(creds)
+                );
+            }
+        }
+        // check_device 失败不阻断初始化（真实客户端亦非关键路径）
+        Err(e) => debug!(
+            target: "ds_core::accounts",
+            "Account {} check_device failed (ignored): {}",
+            display_id_of(creds),
+            e
+        ),
+    }
+
+    Ok(token)
+}
+
+/// token 模式：校验导入的 Bearer token（不做任何登录）
+///
+/// 只发一次 `GET /users/current`：既确认 token 仍然有效（失效返回
+/// `biz_code=40003 Authorization Failed`），也读取 `user.chat` 做禁言早检。
+async fn verify_imported_token(
+    creds: &AccountConfig,
+    client: &DsClient,
+) -> Result<String, PoolError> {
+    let token = creds.token.trim();
+    let display_id = display_id_of(creds);
+    info!(
+        target: "ds_core::accounts",
+        "Account {display_id} 使用导入的 Bearer token（跳过 /users/login）"
+    );
+
+    let user = client.current_user(token).await?;
+    debug!(
+        target: "ds_core::client",
+        "token 校验成功: user_id={}, email={:?}, mobile={:?}, muted={:?}, mute_until={:?}",
+        user.id,
+        user.email,
+        user.mobile_number,
+        user.chat.as_ref().map(|c| c.is_muted),
+        user.chat.as_ref().and_then(|c| c.mute_until),
+    );
+    ensure_not_muted(&user, display_id, "token 校验")?;
+
+    Ok(token.to_string())
+}
+
+/// 禁言早检（登录响应与 `/users/current` 的 `user` 同构）
+fn ensure_not_muted(user: &UserInfo, display_id: &str, source: &str) -> Result<(), PoolError> {
+    if let Some(chat) = &user.chat
+        && chat.is_muted != 0
+    {
+        error!(
+            target: "ds_core::accounts",
+            "Account {display_id} is muted until {:?} (detected at {source})",
+            chat.mute_until
+        );
+        return Err(PoolError::Validation(format!(
+            "账号异常(muted/limited)，mute_until={:?}",
+            chat.mute_until
+        )));
+    }
+    Ok(())
 }
 
 /// 健康检查用的中性提示词池
@@ -1215,14 +1329,15 @@ mod tests {
             area_code: String::new(),
             password: "pw".to_string(),
             device_id: device_id.to_string(),
+            token: String::new(),
         }
     }
 
     #[test]
     fn terminal_login_errors_stop_retrying() {
         use super::super::client::ClientError;
-        // 封禁 / 禁言 / 设备校验失败 / 凭据错误 → 终止
-        for code in [2, 5, 10, 11] {
+        // 封禁 / 禁言 / 设备校验失败 / 凭据错误 / token 失效（token 模式）→ 终止
+        for code in [2, 5, 10, 11, 40003] {
             assert!(
                 AccountPool::is_terminal_login_error(&PoolError::Client(ClientError::Business {
                     code,
@@ -1234,10 +1349,33 @@ mod tests {
         assert!(AccountPool::is_terminal_login_error(
             &PoolError::Validation("账号异常(muted/limited)".into())
         ));
+        // 无效 Bearer token 的 HTTP 401 同样无法靠重试恢复
+        assert!(AccountPool::is_terminal_login_error(&PoolError::Client(
+            ClientError::Status {
+                status: 401,
+                body: String::new(),
+            }
+        )));
         // 网络类错误仍应重试
         assert!(!AccountPool::is_terminal_login_error(&PoolError::Pow(
             super::super::PowError::NoSolution
         )));
+    }
+
+    #[test]
+    fn token_mode_requires_non_empty_token() {
+        let client = test_client();
+        assert!(
+            !Account::new_invalid(account("a@example.com", ""), 0, &client).uses_imported_token(),
+            "空 token 必须回退到密码模式"
+        );
+
+        let mut creds = account("a@example.com", "");
+        creds.token = "eyJhbGciOi.test".to_string();
+        assert!(
+            Account::new_invalid(creds, 0, &client).uses_imported_token(),
+            "非空 token 应识别为 token 模式"
+        );
     }
 
     #[test]

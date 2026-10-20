@@ -184,6 +184,8 @@ export interface AccountEntry {
   mobile: string;
   area_code: string;
   password: string;
+  /** 浏览器导入的 Bearer token（非空 = token 模式，不调 /users/login） */
+  token?: string;
   device_id?: string;
 }
 

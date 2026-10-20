@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **账号支持 token 认证模式（导入浏览器 Bearer token）**：`[[ds_core.accounts]]` 新增
+  `token` 字段，非空即走 token 模式 —— 初始化不调 `/users/login`、也不调
+  `check_device`，只发一次 `GET /users/current` 校验令牌并读取禁言状态；恢复任务对
+  token 账号同样只做校验，不产生登录流量。令牌失效（`40003` / 401）时账号直接置
+  `invalid` 等重新导入，不再反复登录。管理面板配置页新增该字段（留空/`***` 保存时
+  保留原值）。详见 `docs/development.md`。
+
 ### Fixed
 
 - **内置识别 DeepSeek 原生 DSML 工具调用方言**：模型有时不按提示词输出 `<tool_calls>`

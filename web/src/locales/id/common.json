@@ -92,6 +92,8 @@
       "mobile": "Ponsel",
       "areaCode": "Kode Area",
       "password": "Password",
+      "token": "Bearer Token",
+      "tokenPlaceholder": "Bearer token browser (auth token: tanpa login sandi)",
       "deviceId": "ID Perangkat",
       "deviceIdPlaceholder": "ID sidik jari perangkat browser",
       "add": "Tambah Akun",

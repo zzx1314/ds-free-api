@@ -202,6 +202,17 @@ pub struct Account {
     /// 浏览器设备指纹 ID（可选，规避登录风控用，见 config.example.toml 说明）
     #[serde(default)]
     pub device_id: String,
+    /// 浏览器导入的 Bearer token（非空 = token 模式）
+    ///
+    /// token 模式**不调用 `/users/login`**：直接用从浏览器
+    /// （`chat.deepseek.com` → F12 → Network → 任一 `/api/v0/*` 请求的
+    /// `Authorization: Bearer …`）复制的 token。初始化只做一次
+    /// `GET /users/current` 校验（同时读取禁言状态），此后不再产生登录流量。
+    ///
+    /// 注意：token 会过期，失效后账号被标记为 `invalid`，需要重新导入。
+    /// 账号标识（email / mobile）仍需至少填一个，用于展示与去重。
+    #[serde(default)]
+    pub token: String,
 }
 
 /// 代理配置

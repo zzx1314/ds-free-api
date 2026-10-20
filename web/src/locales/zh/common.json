@@ -92,6 +92,8 @@
       "mobile": "手机",
       "areaCode": "区号",
       "password": "密码",
+      "token": "Bearer Token",
+      "tokenPlaceholder": "浏览器 Bearer token（token 认证，不走密码登录）",
       "deviceId": "设备 ID",
       "deviceIdPlaceholder": "浏览器设备指纹 ID",
       "add": "添加账号",

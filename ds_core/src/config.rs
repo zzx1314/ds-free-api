@@ -63,4 +63,13 @@ pub struct AccountConfig {
     /// 建议**每个账号使用独立的 device_id**：设备级指纹被上游用于关联与画像，
     /// 同一指纹下挂多个账号、累计数百次请求后，账号会被禁言（`biz_code=5`）。
     pub device_id: String,
+    /// 浏览器导入的 Bearer token（非空 = token 模式）
+    ///
+    /// token 模式下**不再调用 `/users/login`**（也不调 `check_device`）：直接在
+    /// 浏览器（`chat.deepseek.com`，F12 → Network → 任一 `/api/v0/*` 请求的
+    /// `Authorization: Bearer …`）复制 token 使用。初始化只做一次
+    /// `GET /users/current` 校验有效性并读取禁言状态。
+    ///
+    /// 注意：token 会过期，失效后账号被标记为 `invalid`，需要重新导入。
+    pub token: String,
 }
