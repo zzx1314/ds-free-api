@@ -41,6 +41,26 @@
 - 主标签: `<|tool▁calls▁begin|>` / `<|tool▁calls▁end|>`
 - 回退列表默认为空, 发现模型输出幻觉变体时再逐个追加到 `extra_starts` / `extra_ends`
 - `<|tool▁calls▁begin|>` 格式模型几乎不产生幻觉, 省去了大量回退维护成本
+- **例外：DeepSeek 原生 DSML 方言由解析器内置识别**（不走 `extra_starts`，无需改配置），见下节
+
+## DeepSeek 原生 DSML 方言（内置识别）
+
+V4 / V4.1 的原生工具调用标记是 DSML，不是本项目提示词约定的 `<tool_calls>` JSON：
+
+```
+<｜DSML｜ calls>                                    ← V4.1（`｜DSML｜` 后带空格）
+<｜DSML｜ invoke name="bash">
+<｜DSML｜ parameter name="command" string="true">ls -la</｜DSML｜ parameter>
+</｜DSML｜ invoke>
+</｜DSML｜ calls>
+```
+
+- V4 的拼写是 `<｜DSML｜tool_calls>`（无空格），客户端渲染时还可能把竖线重复成 `｜｜DSML｜｜`
+- 模型偶尔不遵守提示词、直接吐原生方言。按字面串匹配会漏判，表现为**整段标记原样泄漏进
+  `content`**，客户端拿不到 `tool_calls`（Pi / Claude Code 之类会当成普通文本）
+- `tool_parser.rs` 因此按**结构**识别：`<` [`/`] 竖线+ `DSML` 竖线+ 空格* 名称 属性* `>`，
+  接受 1–4 个竖线（`｜` / `|`）与 `calls` / `tool_calls` / `function_calls` 三种块名
+- 参数按官方规则强制：`string="false"` 走 JSON（数字 / 布尔 / null / 嵌套结构），其余保留原始字符串
 
 ## 2026-09 变更：放弃 `<think>` 注入，回归标准 ChatML
 

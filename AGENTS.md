@@ -355,9 +355,15 @@ Tool definitions are injected as **plain System message content, once** (see `do
 3. **JSON repair**: backslash escaping, unquoted keys
 4. **Fallback tags**: configurable via `TagConfig.extra_starts`/`extra_ends` in `config.toml`
 5. **`<invoke>` XML fallback** for alternative tag formats
-6. `arguments` field normalized to always be a JSON string
+6. **DeepSeek native DSML dialect** recognised structurally, no config needed:
+   `<｜DSML｜ calls>` / `<｜DSML｜ invoke name="...">` / `<｜DSML｜ parameter name="..." string="true">`
+   (V4 spelling has no space after `｜DSML｜`, V4.1 has one, clients may render `｜｜DSML｜｜`;
+   `string="false"` parameters are coerced as JSON). Without it the whole markup leaked into
+   `content` and clients got no `tool_calls`.
+7. `arguments` field normalized to always be a JSON string
 
-Primary tag: `<tool_calls>` (plural). Configurable fallback tags via `TagConfig` in `config.toml`.
+Primary tag: `<tool_calls>` (plural). Configurable fallback tags via `TagConfig` in `config.toml`;
+the DSML dialect is built in and must not be added to `extra_starts`.
 
 ### History Splitting & File Upload
 
@@ -646,7 +652,7 @@ Follow `docs/code-style.md`:
 | Account init failure | All accounts stuck in init | Bad credentials (login fails first) or rate-limited (too many sessions). Check `[accounts]` in config |
 | Login fails with `RISK_DEVICE_DETECTED` (biz_code 11) | `客户端错误: Business error: code=11, msg=RISK_DEVICE_DETECTED` during account init | DeepSeek requires a browser-registered device fingerprint. Capture `device_id` from a real browser login (`POST /api/v0/users/login`) and set it per account in `config.toml` / the admin panel |
 | Account init fails with `user is muted` (biz_code 5) | `账号配置错误: 账号异常(muted/limited)`, account left in `invalid` | The account is temporarily muted upstream (response carries `mute_until`, typically days). It cannot be recovered by re-login — stop using the account until `mute_until` passes; further retries do not speed it up. Muting is **delayed**, so "ran N requests without being muted" is not evidence that a change avoids risk control — see `docs/development.md` |
-| Tool call parse failure | No `tool_calls` in response, raw XML visible | Model output a tag variant not in the parse list. Add fallback `extra_starts`/`extra_ends` in `config.toml` `[ds_core]` |
+| Tool call parse failure | No `tool_calls` in response, raw XML visible | Model output a tag variant not in the parse list. The DeepSeek native `<｜DSML｜ calls>` dialect is recognised built-in (check the log line `tool_parser parsed N tool call(s)`); other variants need a fallback in `extra_starts`/`extra_ends` (`[ds_core]` in `config.toml`) |
 | Rate limited | Repeated `CoreError::Overloaded` | Add more accounts or reduce concurrency. 6x exponential backoff handles transient spikes |
 | Session errors mid-stream | `invalid message id`, session not found | Usually handled by `GuardedStream::drop` cleanup. If persistent, check concurrent access to same account |
 | API request always 401 | `{"error":{"message":"invalid api token"}}` on every `/v1/*` call | `api_keys` is empty or the token doesn't match; there is **no** auth-free mode. Add a key via the admin panel |

@@ -5,6 +5,10 @@
 //!   先追加到缓冲区，扫描 `<tool_calls>`（或回退 `<tool_call>`），未找到则释放超出 W 的安全部分
 //! - CollectingXml 状态：检测到标记后收集内容直到 `</tool_calls>`
 //! - Done 状态：工具调用已发出，截断后续内容（防幻觉）
+//!
+//! 除提示词约定的 `<tool_calls>` JSON 外，还内置识别 DeepSeek 原生 DSML 方言
+//! （`<｜DSML｜ calls>` + `<｜DSML｜ invoke>` / `<｜DSML｜ parameter>`），
+//! 详见下方「DeepSeek 原生 DSML 方言」一节。
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -96,7 +100,211 @@ fn match_start_tag<'a>(s: &'a str, tag: &str) -> Option<(usize, &'a str)> {
         .or_else(|| fuzzy_match_tag(s, partial))
 }
 
+// ── DeepSeek 原生 DSML 方言 ──────────────────────────────────────────────
+//
+// DeepSeek V4 / V4.1 的原生工具调用标记不是 `<tool_calls>` JSON，而是 DSML：
+//
+//   <｜DSML｜ calls>                                        ← V4.1（`｜DSML｜` 后带空格）
+//   <｜DSML｜ invoke name="bash">
+//   <｜DSML｜ parameter name="command" string="true">ls</｜DSML｜ parameter>
+//   </｜DSML｜ invoke>
+//   </｜DSML｜ calls>
+//
+// V4 的拼写是 `<｜DSML｜tool_calls>`（无空格），客户端渲染时还会把竖线重复成
+// `｜｜DSML｜｜`。模型没有按提示词使用 `<tool_calls>` 时会直接吐这个方言，按字面串
+// 匹配必然漏判 —— 表现为整段标记原样泄漏进 `content`，客户端拿不到 `tool_calls`。
+// 因此这里按**结构**识别：`<` [`/`] 竖线+ `DSML` 竖线+ 空格* 名称 属性* `>`。
+//
+// 该方言是内置支持，不走 `extra_starts` / `extra_ends`（不需要用户改配置）。
+
+/// DSML 标签：`<｜DSML｜ 名称 属性...>` 或 `</｜DSML｜ 名称>`
+struct DsmlTag<'a> {
+    /// 是否结束标签（`</...>`）
+    closing: bool,
+    /// 标签名称（`calls` / `invoke` / `parameter`）
+    name: &'a str,
+    /// 名称之后的属性文本（`name="..."`、`string="true"` 等）
+    attrs: &'a str,
+    /// 标签结束（`>` 之后）的字节偏移
+    end: usize,
+}
+
+/// 单个 DSML 标签的属性/名称部分最长字节数，超出即视为误判（避免跨行吞掉正文）
+const DSML_TAG_MAX_LEN: usize = 256;
+
+/// 跳过 `｜`(U+FF5C) / `|` 组成的竖线串，要求至少 1 个、至多 4 个
+fn strip_dsml_bars(s: &str) -> Option<&str> {
+    let mut n = 0usize;
+    let mut idx = 0usize;
+    let mut iter = s.char_indices().peekable();
+    while let Some(&(i, c)) = iter.peek() {
+        if c != '｜' && c != '|' {
+            break;
+        }
+        n += 1;
+        idx = i + c.len_utf8();
+        iter.next();
+    }
+    (n > 0 && n <= 4).then_some(&s[idx..])
+}
+
+/// 解析位于 `s` 起始处的 DSML 标签（`s` 必须以 `<` 开头），不匹配则返回 `None`
+fn parse_dsml_tag(s: &str) -> Option<DsmlTag<'_>> {
+    let rest = s.strip_prefix('<')?;
+    let (closing, rest) = rest.strip_prefix('/').map_or((false, rest), |r| (true, r));
+    let rest = strip_dsml_bars(rest)?;
+    let rest = rest
+        .strip_prefix("DSML")
+        .or_else(|| rest.strip_prefix("dsml"))?;
+    let rest = strip_dsml_bars(rest)?;
+    let rest = rest.trim_start_matches(&[' ', '\t'][..]);
+    let name_end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    if name_end == 0 {
+        return None;
+    }
+    let (name, rest) = rest.split_at(name_end);
+    let gt = rest.find('>').filter(|p| *p <= DSML_TAG_MAX_LEN)?;
+    Some(DsmlTag {
+        closing,
+        name,
+        attrs: &rest[..gt],
+        end: s.len() - rest.len() + gt + 1,
+    })
+}
+
+/// 工具调用块标签名：V4.1 为 `calls`，V4 为 `tool_calls`
+fn is_dsml_calls_name(name: &str) -> bool {
+    matches!(name, "calls" | "tool_calls" | "function_calls")
+}
+
+/// 从 `from` 起查找第一个满足条件的 DSML 标签，返回（起始字节偏移, 标签）
+fn find_dsml_tag_with<'a>(
+    s: &'a str,
+    from: usize,
+    closing: bool,
+    want: impl Fn(&str) -> bool,
+) -> Option<(usize, DsmlTag<'a>)> {
+    let mut pos = from;
+    while let Some(rel) = s[pos..].find('<') {
+        let abs = pos + rel;
+        if let Some(tag) = parse_dsml_tag(&s[abs..])
+            && tag.closing == closing
+            && want(tag.name)
+        {
+            return Some((abs, tag));
+        }
+        pos = abs + 1;
+    }
+    None
+}
+
+/// `tag` 是否是工具调用块的 DSML 开始标签（允许传入缺少结尾 `>` 的部分匹配结果）
+fn is_dsml_start_tag(tag: &str) -> bool {
+    let padded;
+    let candidate = if tag.ends_with('>') {
+        tag
+    } else {
+        padded = format!("{tag}>");
+        &padded
+    };
+    parse_dsml_tag(candidate).is_some_and(|t| !t.closing && is_dsml_calls_name(t.name))
+}
+
+/// 读取 DSML 标签属性值，如 `name="bash"`
+fn dsml_attr<'a>(attrs: &'a str, key: &str) -> Option<&'a str> {
+    let mut rest = attrs;
+    loop {
+        let eq = rest.find('=')?;
+        let attr_name = rest[..eq]
+            .trim_end()
+            .rsplit(char::is_whitespace)
+            .next()
+            .unwrap_or_default();
+        let after = rest[eq + 1..].trim_start();
+        let quote = after.chars().next()?;
+        if quote != '"' && quote != '\'' {
+            rest = &after[quote.len_utf8()..];
+            continue;
+        }
+        let body = &after[quote.len_utf8()..];
+        let end = body.find(quote)?;
+        if attr_name == key {
+            return Some(&body[..end]);
+        }
+        rest = &body[end + quote.len_utf8()..];
+    }
+}
+
+/// 把一个 `<｜DSML｜ invoke>` 的内部正文解析为 `arguments` JSON 字符串
+///
+/// `string="false"` 的参数按 JSON 解析（数字 / 布尔 / null / 嵌套结构），
+/// 其余保持原始字符串 —— 与官方 parser 的参数强制规则一致。
+fn dsml_arguments(body: &str) -> String {
+    use std::collections::BTreeMap;
+
+    let mut params: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    let mut pos = 0;
+    while let Some((p_pos, p_tag)) = find_dsml_tag_with(body, pos, false, |n| n == "parameter") {
+        let value_start = p_pos + p_tag.end;
+        let Some((close_pos, close_tag)) =
+            find_dsml_tag_with(body, value_start, true, |n| n == "parameter")
+        else {
+            break;
+        };
+        pos = close_pos + close_tag.end;
+        let Some(name) = dsml_attr(p_tag.attrs, "name") else {
+            continue;
+        };
+        let raw = &body[value_start..close_pos];
+        let typed = dsml_attr(p_tag.attrs, "string").is_some_and(|s| s == "false");
+        let value = if typed {
+            serde_json::from_str(raw.trim())
+                .unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
+        } else {
+            serde_json::Value::String(raw.to_string())
+        };
+        params.insert(name.to_string(), value);
+    }
+    serde_json::to_string(&params).unwrap_or_else(|_| "{}".into())
+}
+
+/// 解析 DSML 块正文（`<｜DSML｜ invoke>` 序列）为结构化工具调用
+fn parse_dsml_calls(inner: &str) -> Option<Vec<ToolCall>> {
+    let mut calls = Vec::new();
+    let mut pos = 0;
+    while let Some((invoke_pos, invoke_tag)) =
+        find_dsml_tag_with(inner, pos, false, |n| n == "invoke")
+    {
+        let body_start = invoke_pos + invoke_tag.end;
+        let Some((close_pos, close_tag)) =
+            find_dsml_tag_with(inner, body_start, true, |n| n == "invoke")
+        else {
+            break;
+        };
+        pos = close_pos + close_tag.end;
+        let Some(name) = dsml_attr(invoke_tag.attrs, "name") else {
+            continue;
+        };
+        calls.push(ToolCall {
+            id: next_call_id(),
+            ty: "function".to_string(),
+            function: Some(FunctionCall {
+                name: name.to_string(),
+                arguments: dsml_arguments(&inner[body_start..close_pos]),
+            }),
+            custom: None,
+            index: u32::try_from(calls.len()).unwrap_or(u32::MAX),
+        });
+    }
+    (!calls.is_empty()).then_some(calls)
+}
+
 pub(crate) fn contains_start_tag_with(s: &str, cfg: &TagConfig) -> bool {
+    if find_dsml_tag_with(s, 0, false, is_dsml_calls_name).is_some() {
+        return true;
+    }
     if match_start_tag(s, TOOL_CALL_START).is_some() {
         return true;
     }
@@ -109,6 +317,9 @@ pub(crate) fn contains_start_tag_with(s: &str, cfg: &TagConfig) -> bool {
 }
 
 pub(crate) fn find_start_tag_with<'a>(s: &'a str, cfg: &TagConfig) -> Option<(usize, &'a str)> {
+    if let Some((pos, tag)) = find_dsml_tag_with(s, 0, false, is_dsml_calls_name) {
+        return Some((pos, &s[pos..pos + tag.end]));
+    }
     if let Some(m) = match_start_tag(s, TOOL_CALL_START) {
         return Some(m);
     }
@@ -127,6 +338,18 @@ pub(crate) fn find_end_tag_with<'a>(
     start_tag: Option<&str>,
 ) -> Option<(usize, &'a str)> {
     let search = &s[from..];
+    if start_tag.is_some_and(is_dsml_start_tag) {
+        // DSML 块按结构找 `</｜DSML｜ calls>`（容忍竖线数量 / 空格差异）
+        if let Some((pos, tag)) = find_dsml_tag_with(search, 0, true, is_dsml_calls_name) {
+            let abs = from + pos;
+            return Some((abs, &s[abs..abs + tag.end]));
+        }
+        // 未闭合时把下一个 DSML 块开始标签当作结束（与普通标签的回退语义一致）
+        if let Some((pos, tag)) = find_dsml_tag_with(search, 0, false, is_dsml_calls_name) {
+            let abs = from + pos;
+            return Some((abs, &s[abs..abs + tag.end]));
+        }
+    }
     if let Some(st) = start_tag {
         let open_tag = st.trim_end_matches('>');
         let close_tag = format!("</{}>", &open_tag[1..]);
@@ -172,6 +395,9 @@ pub(crate) fn find_end_tag_with<'a>(
 }
 
 fn is_start_tag(tag: &str, cfg: &TagConfig) -> bool {
+    if is_dsml_start_tag(tag) {
+        return true;
+    }
     if !tag.starts_with('<') {
         return false;
     }
@@ -311,6 +537,14 @@ pub fn parse_tool_calls_with(xml: &str, cfg: &TagConfig) -> Option<(Vec<ToolCall
     };
     let inner = &xml[after_start..inner_end];
 
+    // 原生 DSML 方言：正文是 `<｜DSML｜ invoke>` / `<｜DSML｜ parameter>` 结构而非 JSON。
+    // 必须在 JSON 分支之前分流 —— 参数值里常出现 `{`（如 shell 脚本），走 JSON 分支会解析失败。
+    if is_dsml_start_tag(start_tag) {
+        let calls = parse_dsml_calls(inner)?;
+        let remaining = format!("{}{}", &xml[..start], &xml[end..]);
+        return Some((calls, remaining));
+    }
+
     let arr = match inner.find('[') {
         Some(arr_start) => {
             let arr_end = inner.rfind(']').map_or(inner.len(), |p| p + 1);
@@ -346,7 +580,10 @@ pub fn parse_tool_calls_with(xml: &str, cfg: &TagConfig) -> Option<(Vec<ToolCall
                     })?;
                 vec![obj]
             } else {
-                return parse_invoke_calls(inner, &xml[..start], &xml[end..]);
+                // 外面是我们要求的 `<tool_calls>`、里面却是 DSML 正文的情况
+                return parse_dsml_calls(inner)
+                    .map(|calls| (calls, format!("{}{}", &xml[..start], &xml[end..])))
+                    .or_else(|| parse_invoke_calls(inner, &xml[..start], &xml[end..]));
             }
         }
     };
@@ -983,6 +1220,169 @@ mod tests {
         );
         let (calls, _) = parse_tool_calls(&xml).unwrap();
         assert_eq!(calls.len(), 1);
+    }
+
+    // ── DeepSeek 原生 DSML 方言 ──────────────────────────────────────
+
+    /// V4.1 方言：`｜DSML｜` 后带空格，数字参数带 `string="false"`
+    #[test]
+    fn parse_dsml_v41_calls() {
+        let xml = concat!(
+            "<｜DSML｜ calls>\n",
+            "<｜DSML｜ invoke name=\"math::add\">\n",
+            "<｜DSML｜ parameter name=\"a\" string=\"false\">17</｜DSML｜ parameter>\n",
+            "<｜DSML｜ parameter name=\"b\" string=\"false\">25</｜DSML｜ parameter>\n",
+            "</｜DSML｜ invoke>\n",
+            "</｜DSML｜ calls>",
+        );
+        let (calls, remaining) = parse_tool_calls(xml).unwrap();
+        assert!(remaining.is_empty());
+        assert_eq!(calls.len(), 1);
+        let f = calls[0].function.as_ref().unwrap();
+        assert_eq!(f.name, "math::add");
+        assert_eq!(f.arguments, r#"{"a":17,"b":25}"#);
+    }
+
+    /// V4 方言：`｜DSML｜` 后无空格，字符串参数原样保留
+    #[test]
+    fn parse_dsml_v4_calls_with_string_parameter() {
+        let xml = concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"bash\">",
+            "<｜DSML｜parameter name=\"command\" string=\"true\">grep -n 'a|b' -A 20 f.rs</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "</｜DSML｜tool_calls>",
+        );
+        let (calls, remaining) = parse_tool_calls(xml).unwrap();
+        assert!(remaining.is_empty());
+        assert_eq!(calls.len(), 1);
+        let f = calls[0].function.as_ref().unwrap();
+        assert_eq!(f.name, "bash");
+        assert_eq!(f.arguments, r#"{"command":"grep -n 'a|b' -A 20 f.rs"}"#);
+    }
+
+    /// 回归（issue 反馈）：客户端渲染出的 `｜｜DSML｜｜` 重复竖线变体
+    #[test]
+    fn parse_dsml_with_doubled_bars() {
+        let xml = concat!(
+            "<｜｜DSML｜｜ calls>\n",
+            " <｜｜DSML｜｜ invoke name=\"bash\">\n",
+            " <｜｜DSML｜｜ parameter name=\"command\" string=\"true\">ls -la</｜｜DSML｜｜ parameter>\n",
+            " </｜｜DSML｜｜ invoke>\n",
+            " </｜｜DSML｜｜ calls>",
+        );
+        let (calls, _) = parse_tool_calls(xml).unwrap();
+        assert_eq!(calls.len(), 1);
+        let f = calls[0].function.as_ref().unwrap();
+        assert_eq!(f.name, "bash");
+        assert_eq!(f.arguments, r#"{"command":"ls -la"}"#);
+    }
+
+    /// 参数值里的 `{` 不得让解析走 JSON 分支（否则整段工具调用退化到修复流程）
+    #[test]
+    fn parse_dsml_parameter_with_braces() {
+        let xml = concat!(
+            "<｜DSML｜ calls>",
+            "<｜DSML｜ invoke name=\"bash\">",
+            "<｜DSML｜ parameter name=\"command\" string=\"true\">awk '{print $1}' x.txt</｜DSML｜ parameter>",
+            "</｜DSML｜ invoke>",
+            "</｜DSML｜ calls>",
+        );
+        let (calls, _) = parse_tool_calls(xml).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].function.as_ref().unwrap().arguments,
+            r#"{"command":"awk '{print $1}' x.txt"}"#
+        );
+    }
+
+    /// 多个 invoke 应各自成为一个 tool_call
+    #[test]
+    fn parse_dsml_multiple_invokes() {
+        let xml = concat!(
+            "<｜DSML｜ calls>",
+            "<｜DSML｜ invoke name=\"a\"></｜DSML｜ invoke>",
+            "<｜DSML｜ invoke name=\"b\"><｜DSML｜ parameter name=\"n\" string=\"false\">1.5</｜DSML｜ parameter></｜DSML｜ invoke>",
+            "</｜DSML｜ calls>",
+        );
+        let (calls, _) = parse_tool_calls(xml).unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.as_ref().unwrap().name, "a");
+        assert_eq!(calls[0].function.as_ref().unwrap().arguments, "{}");
+        assert_eq!(
+            calls[1].function.as_ref().unwrap().arguments,
+            r#"{"n":1.5}"#
+        );
+    }
+
+    fn text_chunk(content: &str, finish: Option<&'static str>) -> ChatCompletionsResponseChunk {
+        ChatCompletionsResponseChunk {
+            id: "chatcmpl-test".into(),
+            object: "chat.completion.chunk",
+            created: 0,
+            model: "deepseek-default".into(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: Delta {
+                    content: Some(content.to_string()),
+                    ..Default::default()
+                },
+                finish_reason: finish,
+                logprobs: None,
+            }],
+            usage: None,
+            service_tier: None,
+            system_fingerprint: None,
+            obfuscation: None,
+        }
+    }
+
+    /// 逐字符分片（最容易切在多字节竖线 / 标签中间）也要能识别 DSML
+    #[tokio::test]
+    async fn stream_parses_dsml_across_chunk_boundaries() {
+        use futures::StreamExt;
+
+        let text = concat!(
+            "<｜DSML｜ calls>\n",
+            "<｜DSML｜ invoke name=\"bash\">\n",
+            "<｜DSML｜ parameter name=\"command\" string=\"true\">ls -la</｜DSML｜ parameter>\n",
+            "</｜DSML｜ invoke>\n",
+            "</｜DSML｜ calls>",
+        );
+        let mut chunks: Vec<Result<ChatCompletionsResponseChunk, OpenAIAdapterError>> = text
+            .chars()
+            .map(|c| Ok(text_chunk(&c.to_string(), None)))
+            .collect();
+        chunks.push(Ok(text_chunk("", Some("stop"))));
+
+        let mut parser = ToolCallStream::new(
+            futures::stream::iter(chunks),
+            "deepseek-default".into(),
+            std::sync::Arc::new(TagConfig::from_config(
+                &crate::config::ToolCallTagConfig::default(),
+            )),
+        );
+
+        let mut content = String::new();
+        let mut calls = Vec::new();
+        while let Some(item) = parser.next().await {
+            let chunk = item.unwrap();
+            let delta = &chunk.choices[0].delta;
+            if let Some(c) = delta.content.as_deref() {
+                content.push_str(c);
+            }
+            if let Some(tc) = delta.tool_calls.as_ref() {
+                calls = tc.clone();
+            }
+        }
+
+        assert_eq!(content, "", "DSML 标记不得泄漏进 content");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.as_ref().unwrap().name, "bash");
+        assert_eq!(
+            calls[0].function.as_ref().unwrap().arguments,
+            r#"{"command":"ls -la"}"#
+        );
     }
 
     /// 回归（issue #87「反复工具调用」）：保活心跳必须是空 delta。

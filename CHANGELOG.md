@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **内置识别 DeepSeek 原生 DSML 工具调用方言**：模型有时不按提示词输出 `<tool_calls>`
+  JSON，而是吐原生 DSML —— `<｜DSML｜ calls>` / `<｜DSML｜ invoke name="...">` /
+  `<｜DSML｜ parameter name="..." string="true">`。此前解析器只认字面串，整段标记会原样
+  泄漏进 `content`，客户端（Pi / Claude Code 等）拿不到 `tool_calls`。现在按结构识别
+  该方言（V4 无空格拼写、V4.1 带空格拼写、`｜｜DSML｜｜` 重复竖线变体都覆盖），
+  `string="false"` 参数按 JSON 强制类型。流式与非流式两条路径同时生效。
 - **completion payload 的 `source` 改为 `default`**：上游枚举是封闭集合，只接受
   `default` / `landing`；此前按前端 bundle 填的 `input` 现在被 `422` 拒绝
   （`unknown variant `input`, expected `default` or `landing`），导致每个请求都失败。

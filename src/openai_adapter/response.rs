@@ -908,6 +908,46 @@ mod tests {
 
     use std::pin::Pin;
 
+    /// 回归（issue 反馈）：DeepSeek 原生 DSML 方言不得原样泄漏进 content。
+    ///
+    /// 模型没按提示词输出 `<tool_calls>` JSON，而是输出了
+    /// `<｜DSML｜ calls>` / `<｜DSML｜ invoke>` / `<｜DSML｜ parameter>`。
+    #[tokio::test]
+    async fn aggregate_dsml_tool_calls() {
+        let head = "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"bash\">\n";
+        let tail = concat!(
+            "<｜DSML｜ parameter name=\"command\" string=\"true\">ls -la</｜DSML｜ parameter>\n",
+            "</｜DSML｜ invoke>\n",
+            "</｜DSML｜ calls>",
+        );
+        let events = make_full_stream(&[(head, "RESPONSE"), (tail, "RESPONSE")], None);
+        let stream = futures::stream::iter(events);
+        let resp = aggregate(
+            stream,
+            "deepseek-default".into(),
+            super::StreamCfg {
+                include_usage: false,
+                include_obfuscation: false,
+                stop: vec![],
+                prompt_tokens: 0,
+                repair_fn: None,
+                tag_config: default_tag_config(),
+            },
+        )
+        .await
+        .unwrap();
+        let msg = &resp.choices[0].message;
+        assert_eq!(msg.content.as_deref(), Some(""));
+        let calls = msg.tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.as_ref().unwrap().name, "bash");
+        assert_eq!(
+            calls[0].function.as_ref().unwrap().arguments,
+            r#"{"command":"ls -la"}"#
+        );
+        assert_eq!(resp.choices[0].finish_reason, Some("tool_calls"));
+    }
+
     fn to_bytes_stream(
         st: ChunkStream,
     ) -> Pin<Box<dyn Stream<Item = Result<Bytes, OpenAIAdapterError>> + Send>> {
