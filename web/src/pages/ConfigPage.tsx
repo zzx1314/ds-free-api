@@ -393,6 +393,23 @@ export function ConfigPage() {
                       />
                     </div>
 
+                    <div className="sm:col-span-11">
+                      <label htmlFor={`acc-x-device-id-${i}`} className="text-[11px] font-medium text-muted-foreground block mb-1">
+                        {t('config.accounts.xDeviceId')}
+                      </label>
+                      <Input
+                        id={`acc-x-device-id-${i}`}
+                        placeholder={t('config.accounts.xDeviceIdPlaceholder')}
+                        value={a.x_device_id ?? ''}
+                        onChange={(e) => {
+                          const next = [...config.ds_core.accounts];
+                          next[i] = { ...next[i], x_device_id: e.target.value };
+                          update(['ds_core', 'accounts'], next);
+                        }}
+                        className="text-xs font-mono"
+                      />
+                    </div>
+
                     {/* Desktop Delete Button */}
                     <div className="hidden sm:flex sm:col-span-1 justify-end">
                       <Button
@@ -422,7 +439,7 @@ export function ConfigPage() {
             onClick={() =>
               update(['ds_core', 'accounts'], [
                 ...config.ds_core.accounts,
-                { email: '', mobile: '', area_code: '', password: '', token: '', device_id: '' },
+                { email: '', mobile: '', area_code: '', password: '', token: '', device_id: '', x_device_id: '' },
               ])
             }
             className="gap-1.5 text-xs mt-2"

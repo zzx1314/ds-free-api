@@ -8,6 +8,7 @@ pub(crate) mod pool;
 mod pow;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::RwLock;
 
@@ -59,6 +60,10 @@ pub struct Accounts {
     pool: Arc<AccountPool>,
     client: RwLock<DsClient>,
     solver: RwLock<PowSolver>,
+    /// 同一账号两次 completion 的最小间隔（在 `completion()` 内统一生效）
+    ///
+    /// 用原子值保存，管理面板热更新配置时无需重建 `Accounts`。
+    min_request_interval_secs: AtomicU64,
 }
 
 impl Accounts {
@@ -107,6 +112,7 @@ impl Accounts {
             pool,
             client: RwLock::new(client),
             solver: RwLock::new(solver),
+            min_request_interval_secs: AtomicU64::new(config.min_request_interval_secs),
         }))
     }
 
@@ -132,10 +138,10 @@ impl Accounts {
             .get_account_with_wait(5000)
             .await
             .ok_or(CoreError::Overloaded)?;
-        let token = guard.account().token();
-        self.client
-            .read()
-            .await
+        let account = guard.account();
+        let token = account.token();
+        account
+            .client()
             .fetch_sessions(&token, updated_at)
             .await
             .map_err(Into::into)
@@ -165,6 +171,11 @@ impl Accounts {
         std::pin::Pin<Box<dyn futures::Stream<Item = Result<bytes::Bytes, ClientError>> + Send>>,
         CoreError,
     > {
+        // 所有业务 completion（普通请求、分块写入、工具修复）都走这里，
+        // 因此节流逻辑统一放在这里，避免某个分支漏掉而重新出现高频突发。
+        let interval =
+            std::time::Duration::from_secs(self.min_request_interval_secs.load(Ordering::Relaxed));
+        account.pace_request(interval).await;
         account
             .client()
             .completion(&account.token(), pow_header, payload)
@@ -286,6 +297,9 @@ impl Accounts {
         self.pool
             .set_client_solver(client.clone(), solver.clone())
             .await;
+        self.pool.set_hourly_quota(config.hourly_request_quota);
+        self.min_request_interval_secs
+            .store(config.min_request_interval_secs, Ordering::Relaxed);
         *self.client.write().await = client;
         *self.solver.write().await = solver;
         Ok(())

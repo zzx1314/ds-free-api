@@ -49,6 +49,34 @@ device_id = "抓取到的值"
 管理面板 → 配置页也有该字段；提交时留空（或旧前端不发送该字段）会保留服务端已有值，
 因此升级后既有配置无需改动。
 
+### 获取并配置 `x_device_id`（浏览器真实请求头）
+
+`device_id`（数美指纹）和 `x-device-id`（浏览器请求头 UUID）是**两个不同的值**。
+登录 payload 里用前者；页面内所有 `/api/v0/*` XHR 请求头里带后者。代理此前用
+`device_id` 派生一个 UUID 作为 `X-Device-Id`，稳定但不是浏览器实际发出的值。
+
+要最大程度对齐浏览器，从抓 token 的同一个浏览器 profile 里复制真实值：
+
+1. 浏览器登录 `https://chat.deepseek.com`，F12 → Network
+2. 任选一个 `/api/v0/*` 请求 → Request Headers → 复制 `x-device-id`
+3. 填到账号配置：
+
+```toml
+[[ds_core.accounts]]
+email = "you@example.com"
+# ...
+device_id = "数美 device_id"
+x_device_id = "11111111-2222-4333-8444-555555555555"
+```
+
+留空时仍回退到「按 `device_id` 派生」的旧行为，并在 token 模式启动时打一条告警。
+`x_device_id` 同时决定 HIF 令牌分桶，因此应和 `device_id` 来自同一个浏览器 profile。
+
+> token 模式还会校验 token 归属：`GET /users/current` 返回的 email / mobile 必须与配置
+> 一致，否则账号直接标记 `invalid`。这避免把 A 账号的 token 配到 B 账号上。上游可能把
+> email / mobile 打码（如 `zexi********0+1@gmail.com`），因此按 domain + 未打码前缀/后缀
+> 比较；几乎全部打码时无法校验，会放行并记 debug，避免误拒正确 token。
+
 ### token 模式：导入浏览器 Bearer token（不调用 `/users/login`）
 
 不想让代理持有密码、或密码登录总被风控拦截时，可以用 token 模式：账号填上从浏览器
@@ -65,18 +93,19 @@ area_code = ""
 password = ""          # token 模式不需要密码
 token = "eyJhbGciOi..."
 device_id = "Bjyk87PcoVWPPBrs3aHGg...=="  # 强烈建议填（见下）
+x_device_id = "11111111-2222-4333-8444-555555555555"  # 同浏览器抓包的请求头
 ```
 
 `device_id` 在 token 模式下**不参与校验** —— 唯一把它放进请求体的是
-`POST /users/auth_token/check_device`，而 token 模式整个跳过了它。但它仍然决定两件事：
+`POST /users/auth_token/check_device`，而 token 模式整个跳过了它。但它仍然决定
+**HIF 风控令牌分桶**（`x-hif-leim` / `x-hif-dliq` 按设备身份缓存）。
 
-1. **X-Device-Id**（`account_x_device_id`：有 `device_id` 时按它派生，**每个账号唯一**）；
-2. **HIF 风控令牌分桶**（`x-hif-leim` / `x-hif-dliq` 按设备身份缓存）。
-
-留空时会回退到全局派生的 X-Device-Id（默认按 `api_base` 派生），于是所有留空的 token
+`X-Device-Id` 的优先级是：账号 `x_device_id` → 由 `device_id` 派生 → 全局
+`client_device_id`。推荐直接填浏览器真实值，派生值只是为了兼容旧配置。
+留空时回退到全局派生的 X-Device-Id（默认按 `api_base` 派生），于是所有留空的 token
 账号共用同一个设备身份和同一个令牌桶 —— 而 `warn_on_shared_device_ids` 对空值是 `continue`，
-这种共用连告警都不会有。建议把抓 token 的那个浏览器 profile 的数美 `device_id` 一起填上，
-让 X-Device-Id 与 token 的签发设备保持一致。
+这种共用连告警都不会有。建议把抓 token 的那个浏览器 profile 的数美 `device_id` 和
+`x-device-id` 一起填上，让设备身份与 token 的签发设备保持一致。
 
 行为差异（与密码模式对比）：
 
@@ -454,6 +483,25 @@ just e2e-basic --report result.json
 
 3. **`device_id` 文档更正**：从「设备级可复用」改为「**每账号独立**」
 
+4. **同一账号最小请求间隔** `min_request_interval_secs`（默认 8 秒，0 = 不限制）
+   - 在每次业务 completion 前统一生效（普通请求、分块写入、工具修复），
+     并附带最多 20% 抖动，避免「1 秒连发 7 条」的机械突发
+   - 每小时配额只限制总量，无法阻止短时突发；单账号使用时这个间隔更直接
+
+5. **浏览器真实 `x_device_id`**（新增账号字段）
+   - 优先于由数美 `device_id` 派生的 UUID；不再把「派生值」当成浏览器真实值
+   - token 模式启动时若未配置会告警
+
+6. **补齐浏览器 `Origin` 请求头**
+   - 同源 `POST`（登录、建删会话、PoW、completion、上传、stop_stream）带
+     `Origin: https://chat.deepseek.com`
+   - HIF 跨源 `GET` 也带 `Origin`；普通同源 `GET`（`users/current`、`fetch_page`）**不带**，
+     与浏览器行为一致
+
+7. **启动补一次 `fetch_page`**
+   - 登录 / token 校验成功后执行一次 `GET /chat_session/fetch_page`，对齐浏览器启动序列；
+     失败只记 debug，不阻断启动
+
 ### 实务建议
 
 - **不要在单一账号上连续压测**；把请求分散到多个账号，并遵守「并发 = 账号数 ÷ 2」
@@ -545,10 +593,10 @@ x-hif-leim: <来自 hif-leim.deepseek.com 的令牌>
    取令牌失败不阻断业务请求（真实客户端轮询失败时同样只是不带该头）。
 2. `x-hif-leim` 只加在 completion / edit_message（即 SSE 请求）上，与真实客户端一致。
 3. 新配置项 `hif_enabled`（默认 `true`，**仅用于对照实验**）。
-4. **设备身份按账号派生**（v0.6.0 补）：X-Device-Id 由账号的数美 `device_id`
-   派生（`ds-free-api:x-device-id:{device_id}`），HIF 令牌也按设备分桶 —— 对齐真实
-   客户端「一个浏览器 profile = 一个 device_id + 一个 X-Device-Id」，避免多账号
-   被关联成同一台设备；
+4. **设备身份按账号派生**（v0.6.0 补）：X-Device-Id 优先取账号配置的
+   `x_device_id`（浏览器真实请求头），未配置时由数美 `device_id` 派生；
+   HIF 令牌也按设备分桶 —— 对齐真实客户端「一个浏览器 profile = 一个 device_id +
+   一个 X-Device-Id」，避免多账号被关联成同一台设备；
 5. 顺带修掉两个「全局常量指纹」：
    - `client_device_id` 留空时改为**首启生成随机 UUID 并写回配置**（此前按 `api_base`
      派生 ⇒ 所有部署共用同一个 X-Device-Id）；
@@ -840,6 +888,7 @@ UA / `client_platform` / `client_os` 切成 web，则应同时设 `emulation = "
 |------|--------|--------|------|
 | `startup_health_check` | `true`（启动即发一条 completion） | `false` | 官方启动只登录 / check_device / 拉会话列表 |
 | `session_policy` | `per_request`（每轮建删） | `reuse` | 官方一个会话长期复用、几乎不删 |
+| `min_request_interval_secs` | 无 | `8` | 真实用户不会每秒发一条；消除短时突发 |
 | `default_search_enabled` | `true`（无条件搜索） | `false` | 官方只有用户显式打开才搜索 |
 | `emulation` | `okhttp4_12` | `chrome136` | 官方 Web 客户端 = 桌面 Chrome |
 | `user_agent` | `DeepSeek/2.5.0 Android/35` | 桌面 Chrome/140 | 同上 |

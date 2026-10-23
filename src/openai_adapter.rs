@@ -83,6 +83,7 @@ impl OpenAIAdapter {
             model_types: config.ds_core.model_types.clone(),
             input_character_limits: config.ds_core.input_character_limits.clone(),
             hourly_request_quota: config.ds_core.hourly_request_quota,
+            min_request_interval_secs: config.ds_core.min_request_interval_secs,
         };
         let accounts: Vec<AccountConfig> = config
             .ds_core
@@ -94,6 +95,7 @@ impl OpenAIAdapter {
                 area_code: a.area_code.clone(),
                 password: a.password.clone(),
                 device_id: a.device_id.clone(),
+                x_device_id: a.x_device_id.clone(),
                 token: a.token.clone(),
             })
             .collect();
@@ -396,6 +398,7 @@ impl OpenAIAdapter {
             area_code: creds.area_code.clone(),
             password: creds.password.clone(),
             device_id: creds.device_id.clone(),
+            x_device_id: creds.x_device_id.clone(),
             token: creds.token.clone(),
         };
         self.ds_core.add_account(&ac).await
@@ -549,6 +552,7 @@ impl OpenAIAdapter {
             model_types: new_config.ds_core.model_types.clone(),
             input_character_limits: new_config.ds_core.input_character_limits.clone(),
             hourly_request_quota: new_config.ds_core.hourly_request_quota,
+            min_request_interval_secs: new_config.ds_core.min_request_interval_secs,
         };
         self.ds_core.reload_config(&core_cfg).await
     }

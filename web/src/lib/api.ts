@@ -187,6 +187,8 @@ export interface AccountEntry {
   /** 浏览器导入的 Bearer token（非空 = token 模式，不调 /users/login） */
   token?: string;
   device_id?: string;
+  /** 浏览器真实 X-Device-Id 请求头（留空 = 由 device_id 派生） */
+  x_device_id?: string;
 }
 
 export interface DsCoreConfig {
@@ -218,6 +220,8 @@ export interface DsCoreConfig {
   tool_call: ToolCallTagConfig;
   default_search_enabled: boolean;
   hourly_request_quota: number;
+  /** 同一账号两次对话请求的最小间隔秒数（0 = 不限制） */
+  min_request_interval_secs: number;
   responses_store_capacity: number;
   responses_store_ttl_secs: number;
 }
@@ -273,6 +277,7 @@ const DEFAULTS = {
   responsesStoreTtlSecs: 3600,
   defaultSearchEnabled: false,
   hourlyRequestQuota: 60,
+  minRequestIntervalSecs: 8,
 } as const;
 
 /**
@@ -340,6 +345,8 @@ export function normalizeConfig(raw: any): FullConfig {
           ? core.default_search_enabled
           : DEFAULTS.defaultSearchEnabled,
       hourly_request_quota: core.hourly_request_quota ?? DEFAULTS.hourlyRequestQuota,
+      min_request_interval_secs:
+        core.min_request_interval_secs ?? DEFAULTS.minRequestIntervalSecs,
       responses_store_capacity:
         core.responses_store_capacity ?? DEFAULTS.responsesStoreCapacity,
       responses_store_ttl_secs:

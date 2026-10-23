@@ -78,6 +78,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?")[0]
+        with open(LOG + ".gets", "a") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "t": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                        "path": path,
+                        "headers": {
+                            "x-device-id": self.headers.get("x-device-id"),
+                            "origin": self.headers.get("origin"),
+                            "referer": self.headers.get("referer"),
+                        },
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+        if path.endswith("/chat_session/fetch_page"):
+            return self._json(envelope({"chat_sessions": [], "has_more": False}))
         if path.endswith("/client/settings"):
             return self._json(
                 envelope(
@@ -147,10 +165,12 @@ class Handler(BaseHTTPRequestHandler):
                             "headers": {
                                 "x-hif-leim": self.headers.get("x-hif-leim"),
                                 "x-hif-dliq": self.headers.get("x-hif-dliq"),
+                                "x-device-id": self.headers.get("x-device-id"),
                                 "x-client-platform": self.headers.get("x-client-platform"),
                                 "sec-fetch-dest": self.headers.get("sec-fetch-dest"),
                                 "sec-ch-ua-platform": self.headers.get("sec-ch-ua-platform"),
                                 "accept": self.headers.get("accept"),
+                                "origin": self.headers.get("origin"),
                                 "referer": self.headers.get("referer"),
                                 "sec-fetch-site": self.headers.get("sec-fetch-site"),
                             },

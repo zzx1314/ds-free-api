@@ -120,6 +120,13 @@ pub struct DsCoreSection {
     /// 由池中其他账号承接；所有账号都超限时返回 429（而非继续硬打上游）。
     #[serde(default = "default_hourly_request_quota")]
     pub hourly_request_quota: u64,
+    /// 同一账号两次对话请求的最小间隔秒数（0 = 不限制，默认 8）
+    ///
+    /// 真实用户不会以每秒一条的频率连续发消息。该间隔在发出 completion 前生效，
+    /// 并附带 20% 以内的抖动；单账号使用时这是比「每小时配额」更直接的保护，
+    /// 因为它消除了「短时间内连续十几条」的突发形态。
+    #[serde(default = "default_min_request_interval_secs")]
+    pub min_request_interval_secs: u64,
     /// 未显式传入 `web_search_options` 时是否默认开启搜索模式（默认 true）
     ///
     /// `true` 保持历史行为（始终搜索）；设为 `false` 则严格遵循 OpenAI 语义
@@ -202,6 +209,12 @@ pub struct Account {
     /// 浏览器设备指纹 ID（可选，规避登录风控用，见 config.example.toml 说明）
     #[serde(default)]
     pub device_id: String,
+    /// 浏览器真实 `X-Device-Id` 请求头（可选）
+    ///
+    /// 与数美 `device_id` 是两个不同的值；留空时按 `device_id` 派生。
+    /// 要从 F12 → Network → 任一 `/api/v0/*` 请求的请求头复制 `x-device-id`。
+    #[serde(default)]
+    pub x_device_id: String,
     /// 浏览器导入的 Bearer token（非空 = token 模式）
     ///
     /// token 模式**不调用 `/users/login`**：直接用从浏览器
@@ -292,6 +305,15 @@ fn default_input_character_limits() -> Vec<u32> {
 /// 而不是抬高这个值 —— 这正是本配额想传达的约束。
 const fn default_hourly_request_quota() -> u64 {
     60
+}
+
+/// 同一账号两次对话请求的最小间隔（秒）
+///
+/// 8 秒 ≈ 真实用户读完回复再发下一条的最低节奏；配合每小时 60 次配额，
+/// 既能支撑常规交互，又不会出现「1 秒 7 条」这种真实客户端不会有的突发。
+/// 设为 0 可关闭（不建议）。
+const fn default_min_request_interval_secs() -> u64 {
+    8
 }
 
 /// 未传 `web_search_options` 时默认是否开启搜索模式。
@@ -575,6 +597,7 @@ impl Default for DsCoreSection {
             model_aliases: Vec::new(),
             tool_call: ToolCallTagConfig::default(),
             hourly_request_quota: default_hourly_request_quota(),
+            min_request_interval_secs: default_min_request_interval_secs(),
             default_search_enabled: default_search_enabled(),
             responses_store_capacity: default_responses_store_capacity(),
             responses_store_ttl_secs: default_responses_store_ttl_secs(),

@@ -579,6 +579,24 @@ export function SettingsPage() {
             />
             <p className="text-[11px] text-muted-foreground mt-1.5">{t('settings.quotaDesc')}</p>
           </div>
+          <div>
+            <label htmlFor="set-min-interval" className="text-xs font-medium text-muted-foreground block mb-1.5">
+              {t('settings.minRequestInterval')}
+            </label>
+            <Input
+              id="set-min-interval"
+              type="number"
+              min={0}
+              value={config.ds_core.min_request_interval_secs}
+              onChange={(e) =>
+                update(['ds_core', 'min_request_interval_secs'], Number(e.target.value) || 0)
+              }
+              className="font-mono text-xs"
+            />
+            <p className="text-[11px] text-muted-foreground mt-1.5">
+              {t('settings.minRequestIntervalDesc')}
+            </p>
+          </div>
           <label
             htmlFor="set-default-search"
             className="flex items-center gap-3 cursor-pointer select-none"

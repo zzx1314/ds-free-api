@@ -34,7 +34,7 @@ scripts/risk-experiment/extract-device.py capture-新账号.json <email>
 ```
 
 把输出的 `[[ds_core.accounts]]` 块粘进 `config.toml`（填上密码）。
-`X-Device-Id` 由该 `device_id` 自动派生，不用手填。
+`X-Device-Id` 优先取账号配置的 `x_device_id`；未配置时由该 `device_id` 派生。
 
 ### 2. 最小流量冒烟（3 次请求）
 

@@ -47,6 +47,12 @@ pub struct DsCoreConfig {
     pub input_character_limits: Vec<u32>,
     /// 每账号每小时请求上限（0 = 不限制）
     pub hourly_request_quota: u64,
+    /// 同一账号两次对话请求的最小间隔秒数（0 = 不限制）
+    ///
+    /// 真实用户不会以每秒一条的频率连续发消息；高频突发是上游行为风控最明显的
+    /// 信号之一。该间隔在发出 completion 前生效（含会话创建/PoW 时间），并附带
+    /// 20% 以内的抖动，避免形成精确的机械节拍。
+    pub min_request_interval_secs: u64,
 }
 
 /// 单个账号配置
@@ -63,6 +69,14 @@ pub struct AccountConfig {
     /// 建议**每个账号使用独立的 device_id**：设备级指纹被上游用于关联与画像，
     /// 同一指纹下挂多个账号、累计数百次请求后，账号会被禁言（`biz_code=5`）。
     pub device_id: String,
+    /// 浏览器真实 `X-Device-Id` 请求头（可选）
+    ///
+    /// 它和数美 `device_id` 是**两个不同的值**：`device_id` 是登录 payload 里的
+    /// 设备指纹，`X-Device-Id` 是浏览器页面内 XHR 请求头里的 UUID。
+    /// 留空时按 `device_id` 派生一个稳定 UUID，但派生值并不是浏览器实际发出的值；
+    /// 要最大程度对齐浏览器，应该从 F12 → Network → 任一 `/api/v0/*` 请求的
+    /// 请求头里复制 `x-device-id` 填到这里。
+    pub x_device_id: String,
     /// 浏览器导入的 Bearer token（非空 = token 模式）
     ///
     /// token 模式下**不再调用 `/users/login`**（也不调 `check_device`）：直接在

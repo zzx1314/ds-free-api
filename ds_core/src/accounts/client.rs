@@ -147,7 +147,7 @@ where
     })
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct UserInfo {
     pub id: String,
     pub token: String,
@@ -409,7 +409,11 @@ impl ClientIdentity {
     /// 而真实客户端的业务 API 是页面内的 **XHR/fetch**
     /// （抓包：`accept: */*`、`sec-ch-ua-platform: "Windows"`、无 `priority`）。
     /// 本地 echo server 逐头比对见 `docs/development.md`。
-    fn headers(&self, site: FetchSite) -> Result<wreq::header::HeaderMap, ClientError> {
+    fn headers(
+        &self,
+        site: FetchSite,
+        origin: Option<&str>,
+    ) -> Result<wreq::header::HeaderMap, ClientError> {
         let mut h = wreq::header::HeaderMap::new();
         let mut put = |name: &'static str, value: &str| -> Result<(), ClientError> {
             h.insert(
@@ -436,6 +440,11 @@ impl ClientIdentity {
         }
         // 官方 Web 客户端对每个 API 请求都带 Referer（抓包：https://chat.deepseek.com/）
         put(wreq::header::REFERER.as_str(), "https://chat.deepseek.com/")?;
+        // 浏览器对同源 POST / 跨源 GET 会带 Origin；普通 GET 不带。
+        // 由调用方根据请求方法决定是否传入，避免给所有 GET 都加一个多余头。
+        if let Some(origin) = origin {
+            put("Origin", origin)?;
+        }
         // —— 覆盖档位默认的「导航头」，改成页面内 fetch/XHR 的真实形态 ——
         put(wreq::header::ACCEPT.as_str(), "*/*")?;
         put("Sec-Fetch-Dest", "empty")?;
@@ -477,6 +486,8 @@ impl Default for HifConfig {
 pub struct DsClient {
     http: wreq::Client,
     api_base: String,
+    /// 同源 Origin（`https://chat.deepseek.com`；自定义 api_base 时按其实例推导）
+    origin: String,
     wasm_url: String,
     identity: ClientIdentity,
     /// HIF 风控令牌注册表（`x-hif-leim` + `x-hif-dliq`，按设备身份分桶）；None = 已关闭
@@ -505,11 +516,14 @@ impl DsClient {
         }
 
         let http = builder.build().expect("构建 HTTP 客户端失败");
+        let origin = origin_of(&api_base);
         let hif = hif.enabled.then(|| {
-            let headers = identity.headers(FetchSite::CrossSite).unwrap_or_else(|e| {
-                warn!(target: "ds_core::client", "客户端头构造失败，HIF 取令牌将不带拟态头: {e}");
-                wreq::header::HeaderMap::new()
-            });
+            let headers = identity
+                .headers(FetchSite::CrossSite, Some(&origin))
+                .unwrap_or_else(|e| {
+                    warn!(target: "ds_core::client", "客户端头构造失败，HIF 取令牌将不带拟态头: {e}");
+                    wreq::header::HeaderMap::new()
+                });
             super::hif::HifRegistry::new(
                 http.clone(),
                 hif.leim_url.clone(),
@@ -521,6 +535,7 @@ impl DsClient {
         Self {
             http,
             api_base,
+            origin,
             wasm_url,
             identity,
             hif,
@@ -574,9 +589,18 @@ impl DsClient {
             .map(|(_, value)| value)
     }
 
-    /// 客户端通用请求头（登录与鉴权请求共用）
+    /// 客户端通用请求头（登录与鉴权请求共用；GET 不带 Origin）
     fn client_headers(&self) -> Result<wreq::header::HeaderMap, ClientError> {
-        self.identity.headers(FetchSite::SameOrigin)
+        self.identity.headers(FetchSite::SameOrigin, None)
+    }
+
+    /// 同源 POST 请求头：在通用头基础上带 `Origin`
+    ///
+    /// 浏览器只在同源 POST（以及跨源 GET）上发送 `Origin`；真实客户端抓包中
+    /// `/users/login`、`/chat_session/create`、`/chat/completion` 等都带它。
+    fn post_headers(&self) -> Result<wreq::header::HeaderMap, ClientError> {
+        self.identity
+            .headers(FetchSite::SameOrigin, Some(&self.origin))
     }
 
     /// 在 completion（SSE）请求上追加风控令牌头（`x-hif-leim` + `x-hif-dliq`）
@@ -601,12 +625,22 @@ impl DsClient {
         Ok(h)
     }
 
+    fn auth_headers_post(&self, token: &str) -> Result<wreq::header::HeaderMap, ClientError> {
+        let mut h = self.post_headers()?;
+        h.insert(
+            wreq::header::AUTHORIZATION,
+            wreq::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|e| ClientError::InvalidHeader(format!("Authorization: {e}")))?,
+        );
+        Ok(h)
+    }
+
     fn auth_headers_with_pow(
         &self,
         token: &str,
         pow_response: &str,
     ) -> Result<wreq::header::HeaderMap, ClientError> {
-        let mut h = self.auth_headers(token)?;
+        let mut h = self.auth_headers_post(token)?;
         h.insert(
             "X-Ds-Pow-Response",
             wreq::header::HeaderValue::from_str(pow_response)
@@ -631,7 +665,7 @@ impl DsClient {
     }
 
     pub async fn login(&self, payload: &LoginPayload) -> Result<LoginData, ClientError> {
-        let mut h = self.client_headers()?;
+        let mut h = self.post_headers()?;
         h.insert(
             wreq::header::REFERER,
             wreq::header::HeaderValue::from_static("https://chat.deepseek.com/sign_in"),
@@ -682,7 +716,7 @@ impl DsClient {
                 "{}{}",
                 self.api_base, ENDPOINT_USERS_AUTH_TOKEN_CHECK_DEVICE
             ))
-            .headers(self.auth_headers(token)?)
+            .headers(self.auth_headers_post(token)?)
             .json(&serde_json::json!({
                 "device_id": self.identity.device_id,
                 "device_model": self.identity.device_model,
@@ -722,7 +756,7 @@ impl DsClient {
         let resp = self
             .http
             .post(format!("{}{}", self.api_base, ENDPOINT_CHAT_SESSION_CREATE))
-            .headers(self.auth_headers(token)?)
+            .headers(self.auth_headers_post(token)?)
             .json(&serde_json::json!({}))
             .send()
             .await?;
@@ -735,7 +769,7 @@ impl DsClient {
         let resp = self
             .http
             .post(format!("{}{}", self.api_base, ENDPOINT_CHAT_SESSION_DELETE))
-            .headers(self.auth_headers(token)?)
+            .headers(self.auth_headers_post(token)?)
             .json(&serde_json::json!({ "chat_session_id": session_id }))
             .send()
             .await?;
@@ -754,7 +788,7 @@ impl DsClient {
                 "{}{}",
                 self.api_base, ENDPOINT_CHAT_CREATE_POW_CHALLENGE
             ))
-            .headers(self.auth_headers(token)?)
+            .headers(self.auth_headers_post(token)?)
             .json(&serde_json::json!({ "target_path": target_path }))
             .send()
             .await?;
@@ -832,7 +866,7 @@ impl DsClient {
                 "{}{}",
                 self.api_base, ENDPOINT_CHAT_SESSION_UPDATE_TITLE
             ))
-            .headers(self.auth_headers(token)?)
+            .headers(self.auth_headers_post(token)?)
             .json(payload)
             .send()
             .await?;
@@ -849,7 +883,7 @@ impl DsClient {
         let resp = self
             .http
             .post(format!("{}{}", self.api_base, ENDPOINT_CHAT_STOP_STREAM))
-            .headers(self.auth_headers(token)?)
+            .headers(self.auth_headers_post(token)?)
             .json(payload)
             .send()
             .await?;
@@ -910,6 +944,20 @@ impl DsClient {
         }
         Ok(resp.bytes().await?)
     }
+}
+
+/// 从 API base 推导同源 Origin
+///
+/// `https://chat.deepseek.com/api/v0` → `https://chat.deepseek.com`；
+/// 本地假上游/代理也按同样规则得到 `http://host:port`，使 `Origin` 与请求地址自洽。
+fn origin_of(api_base: &str) -> String {
+    let base = api_base.trim();
+    let Some(sep) = base.find("://") else {
+        return "https://chat.deepseek.com".to_string();
+    };
+    let after_scheme = &base[sep + 3..];
+    let host_end = after_scheme.find('/').unwrap_or(after_scheme.len());
+    format!("{}{}", &base[..sep + 3], &after_scheme[..host_end])
 }
 
 /// 由种子字节确定性派生 UUID（RFC 4122 v4 格式）
@@ -1052,9 +1100,30 @@ mod tests {
         assert_eq!(h["sec-ch-ua-platform"], "\"Windows\"");
         assert_eq!(h["referer"], "https://chat.deepseek.com/");
         assert!(
+            !h.contains_key("origin"),
+            "同源 GET 不应带 Origin（浏览器只在 POST / 跨源 GET 上发送）"
+        );
+        assert!(
             !h.contains_key("priority"),
             "不应带地址栏导航才有的 priority 头"
         );
+
+        let post = c.post_headers().expect("post headers");
+        assert_eq!(post["origin"], "https://chat.deepseek.com");
+        assert_eq!(post["sec-fetch-site"], "same-origin");
+    }
+
+    #[test]
+    fn origin_is_derived_from_api_base() {
+        assert_eq!(
+            origin_of("https://chat.deepseek.com/api/v0"),
+            "https://chat.deepseek.com"
+        );
+        assert_eq!(
+            origin_of("http://127.0.0.1:8098/api/v0"),
+            "http://127.0.0.1:8098"
+        );
+        assert_eq!(origin_of("not-a-url"), "https://chat.deepseek.com");
     }
 
     #[test]

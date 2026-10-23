@@ -92,6 +92,8 @@ pub struct DsCoreView {
     pub tool_call: ToolCallTagConfigView,
     /// 每账号每小时请求上限（0 = 不限制）
     pub hourly_request_quota: u64,
+    /// 同一账号两次对话请求的最小间隔秒数（0 = 不限制）
+    pub min_request_interval_secs: u64,
     /// 未显式传 `web_search_options` 时是否默认开启搜索模式
     pub default_search_enabled: bool,
     /// Responses API `previous_response_id` 缓存条数上限
@@ -136,6 +138,8 @@ pub struct AccountView {
     pub area_code: String,
     pub password: String,
     pub device_id: String,
+    /// 浏览器真实 X-Device-Id 请求头（空 = 由 device_id 派生）
+    pub x_device_id: String,
     /// 浏览器导入的 Bearer token（非空 = token 模式，不调 /users/login）
     pub token: String,
 }
@@ -160,6 +164,7 @@ fn mask_config(config: &Config) -> AdminConfigResponse {
                     area_code: a.area_code.clone(),
                     password: a.password.clone(),
                     device_id: a.device_id.clone(),
+                    x_device_id: a.x_device_id.clone(),
                     token: a.token.clone(),
                 })
                 .collect(),
@@ -189,6 +194,7 @@ fn mask_config(config: &Config) -> AdminConfigResponse {
                 extra_ends: config.ds_core.tool_call.extra_ends.clone(),
             },
             hourly_request_quota: config.ds_core.hourly_request_quota,
+            min_request_interval_secs: config.ds_core.min_request_interval_secs,
             default_search_enabled: config.ds_core.default_search_enabled,
             responses_store_capacity: config.ds_core.responses_store_capacity,
             responses_store_ttl_secs: config.ds_core.responses_store_ttl_secs,
@@ -409,6 +415,16 @@ pub(crate) async fn admin_put_config(
                     .find(|e| e.email == a.email && e.mobile == a.mobile)
             {
                 a.device_id.clone_from(&existing.device_id);
+            }
+            // x_device_id 同理：旧前端不发送该字段时不能把它清空
+            if a.x_device_id.is_empty()
+                && let Some(existing) = current
+                    .ds_core
+                    .accounts
+                    .iter()
+                    .find(|e| e.email == a.email && e.mobile == a.mobile)
+            {
+                a.x_device_id.clone_from(&existing.x_device_id);
             }
             // token 为空 / "***" 时保留现有值：GET 会回填真实值，
             // 但旧前端或手写配置不会发送该字段

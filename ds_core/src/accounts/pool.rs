@@ -111,6 +111,8 @@ pub struct Account {
     state: AtomicU8,
     /// 账号最近一次释放的时间戳（ms），用于冷却判断
     last_released: AtomicI64,
+    /// 下一次允许发起 completion 的时间戳（ms），用于最小请求间隔
+    next_request_at: AtomicI64,
     /// 连续登录失败次数
     error_count: AtomicU8,
     /// 原始凭据（用于重新登录）
@@ -156,6 +158,21 @@ fn now_secs() -> i64 {
 /// 当前 Unix 时间戳（毫秒），用于账号释放冷却判断
 fn now_ms() -> i64 {
     unix_timestamp_millis().unwrap_or(i64::MAX)
+}
+
+/// 在基础间隔上叠加 0~20% 的抖动
+///
+/// 真实用户的发送间隔不会精确到毫秒；固定节拍反而是一种机械特征。
+/// 用时间戳低位做抖动，避免引入额外的随机数依赖。
+fn interval_jitter_ms(base_ms: u64) -> u64 {
+    let window = base_ms / 5;
+    if window == 0 {
+        return 0;
+    }
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| u64::from(d.subsec_nanos()));
+    (window.saturating_mul(nanos % 1_000)) / 1_000
 }
 
 /// Unix 秒级时间戳；系统时钟异常（早于 EPOCH / 溢出 i64）时返回 None
@@ -380,6 +397,41 @@ impl Account {
         }
     }
 
+    /// 按最小间隔节流：返回需要等待的时长，并预占下一个可用时间点
+    ///
+    /// 账号在持有 `AccountGuard` 期间是串行的，因此这里不需要额外锁；
+    /// 预占下一个时间点是为了让「失败重试」也遵守同一节奏，而不是在失败后
+    /// 立刻重新打上游。
+    fn reserve_request_slot(&self, min_interval: Duration) -> Option<Duration> {
+        if min_interval.is_zero() {
+            return None;
+        }
+        let base_ms = u64::try_from(min_interval.as_millis()).unwrap_or(u64::MAX);
+        if base_ms == 0 {
+            return None;
+        }
+        let now = now_ms();
+        let scheduled = self.next_request_at.load(Ordering::Relaxed).max(now);
+        let delay_ms = u64::try_from(scheduled.saturating_sub(now)).unwrap_or(u64::MAX);
+        let interval_ms = base_ms.saturating_add(interval_jitter_ms(base_ms));
+        let interval_i64 = i64::try_from(interval_ms).unwrap_or(i64::MAX);
+        self.next_request_at
+            .store(scheduled.saturating_add(interval_i64), Ordering::Relaxed);
+        (delay_ms > 0).then(|| Duration::from_millis(delay_ms))
+    }
+
+    /// 在发出 completion 前等待该账号的最小请求间隔
+    pub(crate) async fn pace_request(&self, min_interval: Duration) {
+        if let Some(delay) = self.reserve_request_slot(min_interval) {
+            debug!(
+                target: "ds_core::accounts",
+                "Account {} pacing request: sleeping {}ms (min_interval={}s)",
+                self.display_id(), delay.as_millis(), min_interval.as_secs()
+            );
+            tokio::time::sleep(delay).await;
+        }
+    }
+
     /// 创建一个 Invalid 状态的账号（初始化失败时使用，仍加入池以便前台展示）
     fn new_invalid(creds: AccountConfig, _hourly_quota: u64, client: &DsClient) -> Self {
         let scoped = client.scoped_to(&account_x_device_id(&creds, client));
@@ -389,6 +441,7 @@ impl Account {
             mobile: creds.mobile.clone(),
             state: AtomicU8::new(AccountState::Invalid as u8),
             last_released: AtomicI64::new(0),
+            next_request_at: AtomicI64::new(0),
             error_count: AtomicU8::new(MAX_ERROR_COUNT),
             creds,
             window: SlidingWindowRateLimiter::new(),
@@ -447,7 +500,9 @@ impl Drop for AccountGuard {
 
 pub struct AccountPool {
     /// 每账号每小时请求上限（0 = 不限制）
-    hourly_quota: u64,
+    ///
+    /// 用原子值保存，管理面板热更新配置时无需重建账号池。
+    hourly_quota: AtomicU64,
     /// 启动时是否用一条 completion 做健康检查（false = 对齐真实客户端启动序列）
     startup_health_check: bool,
     /// 是否复用账号会话（false = 每轮建删，历史行为）
@@ -494,7 +549,7 @@ pub enum PoolError {
 impl AccountPool {
     pub fn new(hourly_quota: u64, startup_health_check: bool) -> Self {
         Self {
-            hourly_quota,
+            hourly_quota: AtomicU64::new(hourly_quota),
             startup_health_check,
             // 默认保持历史行为：不复用会话（每轮建删）
             session_reuse: false,
@@ -583,7 +638,11 @@ impl AccountPool {
                         Err(e) => {
                             warn!(target: "ds_core::accounts", "Account {display_id} initialization failed: {e}");
                             // 即使初始化失败也加入池，标记为 Invalid 以便前台展示
-                            Account::new_invalid(creds.clone(), self.hourly_quota, &client)
+                            Account::new_invalid(
+                                creds.clone(),
+                                self.hourly_quota.load(Ordering::Relaxed),
+                                &client,
+                            )
                         }
                     };
                     Some((display_id, Arc::new(account)))
@@ -681,6 +740,7 @@ impl AccountPool {
         }
 
         let now_ms = now_ms();
+        let hourly_quota = self.hourly_quota.load(Ordering::Relaxed);
 
         let mut best: Option<Arc<Account>> = None;
         let mut best_idle = i64::MIN;
@@ -691,11 +751,11 @@ impl AccountPool {
                 continue;
             }
             // 超出每小时配额的账号本窗口内不再分配（0 = 不限制）
-            if !account.within_quota(self.hourly_quota) {
+            if !account.within_quota(hourly_quota) {
                 debug!(
                     target: "ds_core::accounts",
                     "Account {} quota exhausted (used={}, limit={}), skipping",
-                    account.display_id(), account.window.used(), self.hourly_quota
+                    account.display_id(), account.window.used(), hourly_quota
                 );
                 continue;
             }
@@ -716,7 +776,7 @@ impl AccountPool {
                 Ordering::Relaxed,
             )
             .ok()?;
-        account.record_request(self.hourly_quota);
+        account.record_request(hourly_quota);
         debug!(
             target: "ds_core::accounts",
             "Account {} allocated for request (used_this_window={}, total={}, idle_ms={})",
@@ -730,18 +790,25 @@ impl AccountPool {
 
     /// 获取所有账号的详细状态
     pub fn account_statuses(&self) -> Vec<AccountStatus> {
+        let quota = self.hourly_quota.load(Ordering::Relaxed);
         self.accounts
             .iter()
-            .map(|entry| AccountStatus::from_account(entry.value(), self.hourly_quota))
+            .map(|entry| AccountStatus::from_account(entry.value(), quota))
             .collect()
     }
 
     /// 获取所有账号的详细状态（含统计信息）
     pub fn account_statuses_detailed(&self) -> Vec<AccountStatus> {
+        let quota = self.hourly_quota.load(Ordering::Relaxed);
         self.accounts
             .iter()
-            .map(|entry| AccountStatus::from_account(entry.value(), self.hourly_quota))
+            .map(|entry| AccountStatus::from_account(entry.value(), quota))
             .collect()
+    }
+
+    /// 热更新每账号每小时请求上限（0 = 不限制）
+    pub fn set_hourly_quota(&self, quota: u64) {
+        self.hourly_quota.store(quota, Ordering::Relaxed);
     }
 
     /// 存储 client 和 solver 供恢复任务使用
@@ -878,7 +945,8 @@ impl AccountPool {
         let token = account.token();
 
         let result = match account.client().current_user(&token).await {
-            Ok(user) => ensure_not_muted(&user, &display_id, "token 校验"),
+            Ok(user) => ensure_token_belongs_to(&account.creds, &user)
+                .and_then(|()| ensure_not_muted(&user, &display_id, "token 校验")),
             Err(e) => Err(PoolError::Client(e)),
         };
 
@@ -959,17 +1027,18 @@ impl AccountPool {
 fn warn_on_shared_device_ids(creds: &[AccountConfig]) {
     let mut by_device: std::collections::HashMap<&str, Vec<&str>> =
         std::collections::HashMap::new();
+    let mut by_x_device: std::collections::HashMap<&str, Vec<&str>> =
+        std::collections::HashMap::new();
     for c in creds {
+        let id = display_id_of(c);
         let device = c.device_id.trim();
-        if device.is_empty() {
-            continue;
+        if !device.is_empty() {
+            by_device.entry(device).or_default().push(id);
         }
-        let id = if c.email.is_empty() {
-            c.mobile.as_str()
-        } else {
-            c.email.as_str()
-        };
-        by_device.entry(device).or_default().push(id);
+        let x_device = c.x_device_id.trim();
+        if !x_device.is_empty() {
+            by_x_device.entry(x_device).or_default().push(id);
+        }
     }
 
     for (device, accounts) in by_device {
@@ -981,6 +1050,18 @@ fn warn_on_shared_device_ids(creds: &[AccountConfig]) {
                  The device fingerprint is used by upstream for correlation; \
                  sharing it across accounts increases the risk of muting. \
                  Capture a separate device_id per account (one browser profile each).",
+                accounts.len(), prefix, accounts.join(", ")
+            );
+        }
+    }
+
+    for (device, accounts) in by_x_device {
+        if accounts.len() > 1 {
+            let prefix: String = device.chars().take(12).collect();
+            warn!(
+                target: "ds_core::accounts",
+                "{} accounts share the same X-Device-Id ({}…): {}. \
+                 Each browser profile should have its own X-Device-Id.",
                 accounts.len(), prefix, accounts.join(", ")
             );
         }
@@ -1007,11 +1088,15 @@ async fn init_account(
 
 /// 账号的 X-Device-Id
 ///
-/// - 有数美 `device_id` 时按其派生：稳定、且**每个账号各不相同**（对齐真实客户端
-///   「一个浏览器 profile 一个设备」）；
-/// - 显式配置了全局 `client_device_id` 时以配置为准（多账号共用一台设备的场景）；
-/// - 都没有时回退到客户端自身的设备身份。
+/// 优先级：
+/// 1. 账号显式配置的 `x_device_id`（浏览器抓包里的真实请求头值）；
+/// 2. 由数美 `device_id` 派生：稳定、且**每个账号各不相同**，但派生值不是
+///    浏览器实际发出的 UUID，仅作为未配置时的兜底；
+/// 3. 全局 `client_device_id` / 客户端自身的设备身份。
 fn account_x_device_id(creds: &AccountConfig, client: &DsClient) -> String {
+    if !creds.x_device_id.trim().is_empty() {
+        return creds.x_device_id.trim().to_string();
+    }
     if !creds.device_id.trim().is_empty() {
         return super::client::derive_device_uuid(
             format!("ds-free-api:x-device-id:{}", creds.device_id.trim()).as_bytes(),
@@ -1034,7 +1119,22 @@ async fn try_init_account(
     }
 
     // 设备身份按账号派生（空 device_id 时回退到全局配置的 X-Device-Id）
+    let display_id = display_id_of(creds);
     let x_device_id = account_x_device_id(creds, client);
+    if creds.x_device_id.trim().is_empty() {
+        if creds.token.trim().is_empty() {
+            debug!(
+                target: "ds_core::accounts",
+                "Account {display_id} has no x_device_id; deriving X-Device-Id from the Shumei device_id (not the browser's real value)"
+            );
+        } else {
+            warn!(
+                target: "ds_core::accounts",
+                "Account {display_id} has no x_device_id: X-Device-Id is derived from the Shumei device_id \
+                 and differs from the browser. Copy x-device-id from F12 -> Network -> any /api/v0/* request header"
+            );
+        }
+    }
     let client = &client.scoped_to(&x_device_id);
     // 真实客户端在启动时就取好该设备的 HIF 令牌；这里同样预热，
     // 失败不阻断（与客户端轮询失败时的行为一致）
@@ -1051,7 +1151,19 @@ async fn try_init_account(
         verify_imported_token(creds, client).await?
     };
 
-    let display_id = display_id_of(creds);
+    // 真实客户端随后会拉一次会话列表；这里补上同样的只读请求（失败不阻断）。
+    // 它既是正常启动序列的一部分，也让 token 模式多一次轻量的有效性确认。
+    match client.fetch_sessions(&token, None).await {
+        Ok(data) => debug!(
+            target: "ds_core::accounts",
+            "Account {display_id} startup session list: {} sessions",
+            data.chat_sessions.len()
+        ),
+        Err(e) => debug!(
+            target: "ds_core::accounts",
+            "Account {display_id} startup session list failed (ignored): {e}"
+        ),
+    }
 
     // 健康检查：创建临时 session → 发送 test completion → 删除 session
     //
@@ -1090,6 +1202,7 @@ async fn try_init_account(
         mobile: creds.mobile.clone(),
         state: AtomicU8::new(AccountState::Idle as u8),
         last_released: AtomicI64::new(0),
+        next_request_at: AtomicI64::new(0),
         error_count: AtomicU8::new(0),
         creds: creds.clone(),
         window: SlidingWindowRateLimiter::new(),
@@ -1188,6 +1301,7 @@ async fn verify_imported_token(
     );
 
     let user = client.current_user(token).await?;
+    ensure_token_belongs_to(creds, &user)?;
     debug!(
         target: "ds_core::client",
         "token 校验成功: user_id={}, email={:?}, mobile={:?}, muted={:?}, mute_until={:?}",
@@ -1200,6 +1314,149 @@ async fn verify_imported_token(
     ensure_not_muted(&user, display_id, "token 校验")?;
 
     Ok(token.to_string())
+}
+
+/// 校验导入的 token 确实属于配置里的账号
+///
+/// token 模式不会调用 `/users/login`，因此如果 token 与 `email` / `mobile`
+/// 不是同一个账号，代理会一直以「错误的账号标识」运行（展示、去重、限流、
+/// 设备身份全部错位），而请求本身却仍能成功。这里在初始化时直接拒绝。
+fn ensure_token_belongs_to(creds: &AccountConfig, user: &UserInfo) -> Result<(), PoolError> {
+    let display_id = display_id_of(creds);
+
+    if !creds.email.trim().is_empty() {
+        let configured = creds.email.trim();
+        let actual = user.email.as_deref().unwrap_or("").trim();
+        if actual.is_empty() {
+            debug!(
+                target: "ds_core::accounts",
+                "Cannot verify token email for {display_id}: upstream returned no email; accepting"
+            );
+        } else if !email_matches(configured, actual) {
+            return Err(PoolError::Validation(format!(
+                "导入的 token 不属于账号 {display_id}（token 的 email={:?}），请重新从该账号的浏览器复制 token",
+                user.email
+            )));
+        }
+    }
+
+    if !creds.mobile.trim().is_empty() {
+        let configured = creds.mobile.trim();
+        let actual = user.mobile_number.as_deref().unwrap_or("").trim();
+        if actual.is_empty() {
+            debug!(
+                target: "ds_core::accounts",
+                "Cannot verify token mobile for {display_id}: upstream returned no mobile; accepting"
+            );
+        } else if !mobile_matches(configured, actual) {
+            return Err(PoolError::Validation(format!(
+                "导入的 token 不属于账号 {display_id}（token 的 mobile={:?}），请重新从该账号的浏览器复制 token",
+                user.mobile_number
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// 邮箱比较：上游可能把 email 打码（如 `zexi********0+1@gmail.com`）。
+///
+/// 打码时无法逐字符比较，改为比较 domain + local part 的未打码前缀/后缀；
+/// 如果上游几乎全部打码（可比较字符太少），则放行并记 debug —— 否则正确 token
+/// 会被误判为「不属于该账号」。
+fn email_matches(configured: &str, actual: &str) -> bool {
+    let configured = configured.trim();
+    let actual = actual.trim();
+    if configured.eq_ignore_ascii_case(actual) {
+        return true;
+    }
+
+    let Some((conf_local, conf_domain)) = configured.rsplit_once('@') else {
+        return false;
+    };
+    let Some((actual_local, actual_domain)) = actual.rsplit_once('@') else {
+        return false;
+    };
+    if !conf_domain.eq_ignore_ascii_case(actual_domain) {
+        return false;
+    }
+
+    let Some((prefix, suffix)) = masked_segments(actual_local) else {
+        return false;
+    };
+    if prefix.len() + suffix.len() < 4 {
+        debug!(
+            target: "ds_core::accounts",
+            "Cannot fully verify token email: masked form {actual:?} exposes too little; accepting"
+        );
+        return true;
+    }
+
+    let conf_local = conf_local.to_ascii_lowercase();
+    conf_local.starts_with(&prefix.to_ascii_lowercase())
+        && conf_local.ends_with(&suffix.to_ascii_lowercase())
+}
+
+/// 返回打码字符串中第一个 `*` 之前和最后一个 `*` 之后的片段
+fn masked_segments(value: &str) -> Option<(&str, &str)> {
+    let first = value.find('*')?;
+    let last = value.rfind('*')?;
+    Some((&value[..first], &value[last + 1..]))
+}
+
+/// 手机号比较：忽略 `+86` / `0086` / 空格 / 横线，并兼容上游打码（`138****8000`）
+fn mobile_matches(configured: &str, actual: &str) -> bool {
+    fn digits(s: &str) -> String {
+        s.chars().filter(char::is_ascii_digit).collect()
+    }
+    fn normalize(s: &str) -> String {
+        let d = digits(s);
+        for cc in ["0086", "86"] {
+            if let Some(rest) = d.strip_prefix(cc)
+                && rest.len() >= 10
+            {
+                return rest.to_string();
+            }
+        }
+        d
+    }
+    fn strip_country_code(d: String) -> String {
+        for cc in ["0086", "86"] {
+            if let Some(rest) = d.strip_prefix(cc) {
+                return rest.to_string();
+            }
+        }
+        d
+    }
+
+    let configured = normalize(configured);
+    if configured.is_empty() {
+        return false;
+    }
+
+    if !actual.contains('*') {
+        let actual = normalize(actual);
+        return !actual.is_empty()
+            && (configured == actual
+                || (configured.len() >= 7
+                    && actual.len() >= 7
+                    && (configured.ends_with(&actual) || actual.ends_with(&configured))));
+    }
+
+    let Some((prefix_raw, suffix_raw)) = masked_segments(actual) else {
+        return false;
+    };
+    let prefix = strip_country_code(digits(prefix_raw));
+    let suffix = digits(suffix_raw);
+    if prefix.len() + suffix.len() < 4 {
+        debug!(
+            target: "ds_core::accounts",
+            "Cannot fully verify token mobile: masked form {actual:?} exposes too little; accepting"
+        );
+        return true;
+    }
+
+    configured.starts_with(&prefix) && configured.ends_with(&suffix)
 }
 
 /// 禁言早检（登录响应与 `/users/current` 的 `user` 同构）
@@ -1329,6 +1586,7 @@ mod tests {
             area_code: String::new(),
             password: "pw".to_string(),
             device_id: device_id.to_string(),
+            x_device_id: String::new(),
             token: String::new(),
         }
     }
@@ -1393,6 +1651,124 @@ mod tests {
     }
 
     #[test]
+    fn explicit_x_device_id_wins_over_derived_value() {
+        let client = test_client();
+        let mut creds = account("a@example.com", "shumei-device-a");
+        creds.x_device_id = "11111111-2222-4333-8444-555555555555".to_string();
+        assert_eq!(
+            account_x_device_id(&creds, &client),
+            "11111111-2222-4333-8444-555555555555",
+            "浏览器真实 X-Device-Id 必须优先于派生值"
+        );
+        // 两侧空白应被忽略
+        creds.x_device_id = "  11111111-2222-4333-8444-555555555555  ".to_string();
+        assert_eq!(
+            account_x_device_id(&creds, &client),
+            "11111111-2222-4333-8444-555555555555"
+        );
+    }
+
+    #[test]
+    fn token_ownership_is_checked_before_use() {
+        let mut creds = account("owner@example.com", "dev");
+        creds.mobile = "13800138000".to_string();
+        let user = UserInfo {
+            id: "u".to_string(),
+            token: "t".to_string(),
+            email: Some("other@example.com".to_string()),
+            mobile_number: Some("13800138000".to_string()),
+            chat: None,
+        };
+        assert!(
+            ensure_token_belongs_to(&creds, &user).is_err(),
+            "token 属于其他邮箱时必须拒绝"
+        );
+
+        let user = UserInfo {
+            email: Some("OWNER@example.com".to_string()),
+            ..user
+        };
+        assert!(
+            ensure_token_belongs_to(&creds, &user).is_ok(),
+            "邮箱比较应忽略大小写，手机号一致即可"
+        );
+
+        let user = UserInfo {
+            mobile_number: Some("+86 138-0013-8000".to_string()),
+            ..user
+        };
+        assert!(
+            ensure_token_belongs_to(&creds, &user).is_ok(),
+            "手机号比较应忽略区号/空格/横线"
+        );
+    }
+
+    #[test]
+    fn masked_upstream_identifiers_are_not_rejected() {
+        let mut creds = account("zexinzhang330+1@gmail.com", "dev");
+        creds.mobile = "13800138000".to_string();
+
+        let user = UserInfo {
+            id: "u".to_string(),
+            token: "t".to_string(),
+            email: Some("zexi********0+1@gmail.com".to_string()),
+            mobile_number: Some("138****8000".to_string()),
+            chat: None,
+        };
+        assert!(
+            ensure_token_belongs_to(&creds, &user).is_ok(),
+            "上游打码 email/mobile 时不应把正确 token 误判为不属于该账号"
+        );
+
+        let wrong_email = UserInfo {
+            email: Some("evil********0+1@gmail.com".to_string()),
+            ..user.clone()
+        };
+        assert!(
+            ensure_token_belongs_to(&creds, &wrong_email).is_err(),
+            "打码后前缀/后缀都不匹配时必须拒绝"
+        );
+
+        let wrong_mobile = UserInfo {
+            mobile_number: Some("139****8000".to_string()),
+            ..user.clone()
+        };
+        assert!(
+            ensure_token_belongs_to(&creds, &wrong_mobile).is_err(),
+            "打码手机号前缀不匹配时必须拒绝"
+        );
+
+        let fully_masked = UserInfo {
+            email: Some("***@gmail.com".to_string()),
+            mobile_number: Some("****".to_string()),
+            ..user
+        };
+        assert!(
+            ensure_token_belongs_to(&creds, &fully_masked).is_ok(),
+            "上游几乎全部打码时无法校验，应放行而不是误拒"
+        );
+    }
+
+    #[test]
+    fn request_slots_are_reserved_with_min_interval() {
+        let account = idle_account("pace@example.com");
+        let interval = Duration::from_secs(8);
+        assert!(
+            account.reserve_request_slot(interval).is_none(),
+            "首次请求不应等待"
+        );
+        let delay = account
+            .reserve_request_slot(interval)
+            .expect("第二次请求必须等待");
+        assert!(
+            delay >= Duration::from_secs(7) && delay <= Duration::from_secs(10),
+            "等待时长应接近 8s（含最多 20% 抖动）: {delay:?}"
+        );
+        // 间隔为 0 时不节流
+        assert!(account.reserve_request_slot(Duration::ZERO).is_none());
+    }
+
+    #[test]
     fn sliding_window_counts_and_reports_usage() {
         let w = SlidingWindowRateLimiter::new();
         assert_eq!(w.used(), 0);
@@ -1408,6 +1784,18 @@ mod tests {
             a.record_request(0);
         }
         assert!(a.within_quota(0), "0 必须表示不限制");
+    }
+
+    #[test]
+    fn quota_can_be_updated_at_runtime() {
+        let pool = AccountPool::new(3, true);
+        assert_eq!(pool.hourly_quota.load(Ordering::Relaxed), 3);
+        pool.set_hourly_quota(0);
+        assert_eq!(
+            pool.hourly_quota.load(Ordering::Relaxed),
+            0,
+            "管理面板热更新必须立即生效"
+        );
     }
 
     #[test]
@@ -1547,7 +1935,11 @@ mod tests {
         let pool = pool.with_session_reuse(true, 900);
         assert!(pool.session_reuse);
         assert_eq!(pool.session_idle_secs, 900);
-        assert_eq!(pool.hourly_quota, 10, "其它配置不应被改动");
+        assert_eq!(
+            pool.hourly_quota.load(Ordering::Relaxed),
+            10,
+            "其它配置不应被改动"
+        );
     }
 
     /// 空账号池回收会话是安全的空操作
@@ -1565,6 +1957,7 @@ mod tests {
             mobile: String::new(),
             state: AtomicU8::new(AccountState::Idle as u8),
             last_released: AtomicI64::new(0),
+            next_request_at: AtomicI64::new(0),
             error_count: AtomicU8::new(0),
             creds: account(email, "dev"),
             window: SlidingWindowRateLimiter::new(),
